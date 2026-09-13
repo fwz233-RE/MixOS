@@ -1,56 +1,92 @@
-"""Offline checks for the app-only flash safety gates; never opens hardware."""
+"""Offline checks for the app-only flash safety gates; never opens hardware.
+
+These exercise pure validation logic (snapshot shape, partition table
+agreement, image headers). The module under test no longer imports fcntl at
+startup, so the checks run on any platform instead of skipping everywhere but
+Linux.
+"""
 from pathlib import Path
 import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
+import update_esp
 
 
-@unittest.skipUnless(sys.platform == 'linux', 'Pi-side updater requires Linux')
+def table_image(layout='ab'):
+    """A real partition-table image for the named audited layout.
+
+    The fixture used to be ``bytes([0xAA]) * 0xC00``, which stopped being
+    parseable once verify_snapshot began identifying the live layout. Building
+    the table from the same definition the tool validates against keeps the
+    fixture honest.
+    """
+    return update_esp.encode_partition_binary(update_esp.LAYOUTS[layout]['rows'])
+
+
 class FlashChecks(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         import flash_esp_on_pi
         cls.updater = flash_esp_on_pi
 
-    def snapshot(self):
+    def snapshot(self, layout='ab'):
+        """An 8 MiB flash image that verify_snapshot should accept."""
         data = bytearray(b'\xff' * 0x800000)
-        table = bytes([0xAA]) * 0xC00
+        table = table_image(layout)
         data[0] = data[0x10000] = 0xE9
         data[0x8000:0x8C00] = table
         data[0x210000:0x210004] = b'\x00\x01\x00\x00'
         return data, table
 
     def test_valid_snapshot(self):
-        data, table = self.snapshot()
-        self.updater.verify_snapshot(data, table)
+        for layout in ('legacy', 'ab'):
+            with self.subTest(layout=layout):
+                data, table = self.snapshot(layout)
+                live = self.updater.verify_snapshot(data, table, migrate=False)
+                self.assertEqual(live['name'], layout)
 
-    def test_wrong_layout(self):
+    def test_layout_mismatch_requires_migrate(self):
+        """A legacy device offered an A/B table must be told to migrate."""
+        data, _ = self.snapshot('legacy')
+        ab_table = table_image('ab')
+        with self.assertRaises(ValueError) as caught:
+            self.updater.verify_snapshot(data, ab_table, migrate=False)
+        self.assertIn('--migrate', str(caught.exception))
+        live = self.updater.verify_snapshot(data, ab_table, migrate=True)
+        self.assertEqual(live['name'], 'legacy')
+
+    def test_unreadable_live_table(self):
         data, table = self.snapshot()
-        data[0x8000] ^= 1
+        data[0x8000:0x8C00] = b'\xAA' * 0xC00
         with self.assertRaises(ValueError):
-            self.updater.verify_snapshot(data, table)
+            self.updater.verify_snapshot(data, table, migrate=True)
 
     def test_missing_font(self):
         data, table = self.snapshot()
         data[0x210000:0x210004] = b'\xff' * 4
         with self.assertRaises(ValueError):
-            self.updater.verify_snapshot(data, table)
+            self.updater.verify_snapshot(data, table, migrate=False)
 
     def test_incomplete_backup(self):
         data, table = self.snapshot()
         with self.assertRaises(ValueError):
-            self.updater.verify_snapshot(data[:-1], table)
+            self.updater.verify_snapshot(data[:-1], table, migrate=False)
 
     def test_bad_bootloader(self):
         data, table = self.snapshot()
         data[0] = 0
         with self.assertRaises(ValueError):
-            self.updater.verify_snapshot(data, table)
+            self.updater.verify_snapshot(data, table, migrate=False)
+
+    def test_built_table_must_be_full_size(self):
+        data, table = self.snapshot()
+        with self.assertRaises(ValueError):
+            self.updater.verify_snapshot(data, table[:-1], migrate=False)
 
     def test_download_probe_never_invokes_esptool(self):
         import hashlib
@@ -58,14 +94,22 @@ class FlashChecks(unittest.TestCase):
         ident = dict(vid='303a', pid='80c3', serial='TD0720', location='5-1.2')
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            table = b'test-table'
+            table = table_image('legacy')
             (root / 'partition-table.bin').write_bytes(table)
             argv = ['probe', '--serial', 'TD0720', '--boot-mode', 'legacy', '--sha256', 'test',
                     '--partition-sha256', hashlib.sha256(table).hexdigest(), '--probe-download']
+            # The real lock needs fcntl. Substituting a recording context keeps
+            # the assertion that the probe runs under the update lock while
+            # letting the check run on any development machine.
+            lock = MagicMock()
             with (patch.object(u, 'ROOT', root), patch.object(sys, 'argv', argv),
-                  patch.object(u.os, 'geteuid', return_value=1000),
+                  patch.object(sys, 'platform', 'linux'),
+                  patch.object(u, 'device_lock', lock),
+                  patch.object(u.os, 'geteuid', return_value=1000, create=True),
                   patch.object(u.Path, 'home', return_value=root),
-                  patch.object(u, 'validate_image'), patch.object(u, 'validate_partitions'),
+                  patch.object(u, 'validate_image'),
+                  patch.object(u, 'validate_partitions',
+                               return_value=dict(update_esp.LAYOUTS['legacy'], name='legacy')),
                   patch.object(u.shutil, 'which', return_value='/usr/bin/fuser'),
                   patch.object(u.shutil, 'disk_usage', return_value=SimpleNamespace(free=64 * 1024 * 1024)),
                   patch.object(u.subprocess, 'run', return_value=SimpleNamespace(stdout='inactive')),
@@ -74,6 +118,7 @@ class FlashChecks(unittest.TestCase):
                   patch.object(u, 'wait_port', return_value=('/dev/ttyACM0', dict(ident, pid='1001'))),
                   patch.object(u, 'flash_session') as esp, patch.object(u, 'audit') as audit):
                 u.main()
+                lock.assert_called_once()
                 enter.assert_called_once()
                 esp.assert_not_called()
                 self.assertEqual(audit.call_args.args[0], 'download_probe_verified')
@@ -132,7 +177,7 @@ class FlashChecks(unittest.TestCase):
                 image.write_bytes(b'app-data')
                 data, table = self.snapshot()
                 if not valid:
-                    data[0x8000] ^= 1
+                    data[0x210000:0x210004] = b'\xff' * 4  # font header gone -> refuse to write
                 chip = Mock()
                 chip.get_security_info.return_value = dict(flags=0, chip_id=9, flash_crypt_cnt=0)
                 chip.read_mac.return_value = bytes.fromhex('70041dd85414')

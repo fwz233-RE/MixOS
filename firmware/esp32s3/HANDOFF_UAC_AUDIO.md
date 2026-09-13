@@ -3,7 +3,7 @@
 > ✅ **已解决（2026-08-12）**：根因不在固件，是 **CM4 主机侧 dwc2 驱动的
 > split-ISO OUT 调度问题**。macOS 走同一颗 hub 出声完美 → 锁定主机；
 > `[cm4]` 段改 `otg_mode=1`（BCM2711 内置 XHCI）后 Pi 稳定出声。
-> 详见 `docs/cm4_dwc2_uac_no_audio_xhci_fix_2026-08.md` 和 CLAUDE.md 踩坑 #17。
+> 详见上游项目（本仓库之外）的 `cm4_dwc2_uac_no_audio_xhci_fix_2026-08` 记录和 CLAUDE.md 踩坑 #17。
 > 固件现为纯 UAC（non-AS_PART，commit `bb87ded`），CDC 魔串待加回。
 > 以下为历史排查记录，其中"hub TT 嫌疑"的方向已被证伪。
 
@@ -81,7 +81,7 @@ static esp_err_t uac_output_cb(uint8_t *buf, size_t len, void *ctx) {
 REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
 esp_restart();   // ROM 复位后进下载模式，esptool 无按钮可刷
 ```
-（借鉴 `firmware/cm3_usb_wifi_dongle/main/CLI_Commands.c` 的 download 命令。S3 的 USB PHY 被 tinyusb 占了 → USB-Serial-JTAG 没了 → esptool 自动复位不了 → 这个魔串是唯一的软件刷机口。）
+（借鉴上游项目 cm3_usb_wifi_dongle 的 `CLI_Commands.c` download 命令，该文件不在本仓库内。S3 的 USB PHY 被 tinyusb 占了 → USB-Serial-JTAG 没了 → esptool 自动复位不了 → 这个魔串是唯一的软件刷机口。）
 
 ---
 

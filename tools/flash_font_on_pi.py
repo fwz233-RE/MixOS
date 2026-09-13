@@ -8,17 +8,14 @@ A fresh full backup and exact live layout/app checks precede every write.
 --new-app-sha256 explicitly enables app replacement.
 """
 import argparse
-import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shlex
-import signal
 import stat
 import time
-from contextlib import contextmanager
 import shutil
 import struct
 import subprocess
@@ -27,6 +24,8 @@ import sys
 # The launcher uses -I. Add only this root-owned package's helper directory;
 # never depend on user-site packages or the process working directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _mixlib.guards import device_lock, operation_timeout
+from _mixlib.durable import durable_new, sync_directory
 import flash_esp_on_pi as esp
 import display_transport as transport
 from update_esp import (physical_identity, validate_image, validate_partitions,
@@ -102,18 +101,8 @@ def select_direct_device(serial, location, rom_serial):
     return dev, ident, rom
 
 
-@contextmanager
-def operation_timeout(label, seconds):
-    """Bound even a stream that keeps receiving partial bytes without completing."""
-    def expired(signum, frame):
-        raise TimeoutError(label + ' timed out; no automatic retry')
-    previous = signal.signal(signal.SIGALRM, expired)
-    try:
-        signal.setitimer(signal.ITIMER_REAL, seconds)
-        yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
+# operation_timeout moved to tools/_mixlib/guards.py, which degrades on
+# platforms without SIGALRM instead of failing at import.
 
 
 def configure_port(chip):
@@ -360,16 +349,10 @@ def verify_migrated(after, before):
     return {'layout': 'ab', 'boot_slot': 'ota_0', 'otadata': 'blank', 'carried_over': sorted(carried)}
 
 
-def durable_new(path, data):
-    with path.open('xb') as output:
-        output.write(data)
-        output.flush()
-        os.fsync(output.fileno())
-    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
+# durable_new and operation_timeout now live in tools/_mixlib; see the imports
+# at the top of this file. They were duplicated across three tools, and the
+# copies used os.O_DIRECTORY and signal.SIGALRM unconditionally, which made
+# every module that imported them unusable off Linux.
 
 
 def partition_payload(data, size, what, magic=None):
@@ -590,7 +573,7 @@ def main():
                           'app_update': sha(new_app) if new_app else None,
                           'migrate_to_ab': sha(bootloader) if bootloader else None}))
         return
-    if sys.platform != 'linux' or os.geteuid() == 0:
+    if sys.platform != 'linux' or getattr(os, 'geteuid', lambda: 0)() == 0:
         raise RuntimeError('Run as an ordinary Linux dialout user')
     if args.workdir is None or not args.workdir.is_absolute():
         raise ValueError('--execute requires a new absolute --workdir')
@@ -603,14 +586,9 @@ def main():
         raise RuntimeError('Stop mixosd before font maintenance')
     cache = Path.home() / '.cache/mixos'
     cache.mkdir(parents=True, exist_ok=True)
-    with (cache / 'flash.lock').open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with device_lock(cache / 'flash.lock'):
         args.workdir.mkdir(mode=0o700, exist_ok=False)
-        parent_fd = os.open(args.workdir.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
+        sync_directory(args.workdir.parent)
         esp.ROOT = args.workdir  # Shared helper logs/vendor files must never alter immutable code.
         durable_new(esp.ROOT / 'font-job-claim.json', b'No automatic retry; inspect audit before recovery.\n')
         reset_rom = False

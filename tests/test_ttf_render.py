@@ -5,9 +5,10 @@ before running. The synthetic test font needs fontTools; real MiSans
 integration is opt-in through MIXOS_TEST_RENDER_FONT and never needs a board.
 """
 import os
-from pathlib import Path
-import subprocess
 import unittest
+from pathlib import Path
+
+from _support import ROOT, posix_path, host_run, require_host_cc
 
 try:
     from fontTools.fontBuilder import FontBuilder
@@ -15,25 +16,16 @@ try:
 except ImportError:
     FontBuilder = None
 
-ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "build/host-font-render"
 FT = ROOT / "firmware/esp32s3/managed_components/espressif__freetype/freetype"
 
 
 def linux(path):
-    text = str(path)
-    if os.name == "nt":
-        return "/mnt/" + text[0].lower() + text[2:].replace("\\", "/")
-    return text
+    return posix_path(path)
 
 
 def execute(args):
-    if os.name == "nt":
-        args = ["wsl.exe", "-d", "Ubuntu-22.04", "--", *args]
-    result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    if result.returncode:
-        raise AssertionError(f"Command failed ({result.returncode}): {args}\n{result.stdout}")
-    return result.stdout
+    return host_run(args)
 
 
 def synthetic_font(path):
@@ -66,14 +58,17 @@ class TtfRendererTests(unittest.TestCase):
     def setUpClass(cls):
         if FontBuilder is None:
             raise unittest.SkipTest("fontTools needed for generated regression fixture")
+        cc = require_host_cc()
         library = ROOT / "build/host-freetype/libfreetyped.a"
         if not library.exists():
-            raise unittest.SkipTest("build the local vendored FreeType static library first")
+            raise unittest.SkipTest(
+                "build the vendored FreeType static library first "
+                "(see docs/TESTING.md, 'Host FreeType')")
         OUT.mkdir(parents=True, exist_ok=True)
         cls.exe = OUT / "ttf_render_harness"
         cls.synthetic = OUT / "synthetic.ttf"
         synthetic_font(cls.synthetic)
-        execute(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-g", "-O1",
+        execute([cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-g", "-O1",
                  "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-no-pie",
                  "-I" + linux(ROOT / "tests/font_stubs"), "-I" + linux(FT / "include"),
                  linux(ROOT / "tests/ttf_render_harness.c"), linux(library), "-lm", "-o", linux(cls.exe)])

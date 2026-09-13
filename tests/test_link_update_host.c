@@ -1,5 +1,6 @@
 /* Exercise production link code, including queue dispatch and public view state. */
 #include <assert.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include "../firmware/esp32s3/main/mix_link.c"
 
@@ -223,6 +224,11 @@ int main(int argc,char **argv){
         setup();ota_begin_frame(75,2*MIX_OTA_CHUNK);
         transport_open=false;mix_link_tick(now,&view);
         assert(!ota_session&&ota_state==MIX_OTA_IDLE&&!view.maintenance_busy);
-    }else assert(0);
-    puts("production maintenance tests passed");return 0;
+    }else{
+        fprintf(stderr,"unknown scenario: %s\n",argv[1]);return 2;
+    }
+    /* Name the scenario that actually ran. A bare "tests passed" line was true
+     * for every zero exit, so a harness that fell through a renamed scenario
+     * still reported success to the Python driver. */
+    printf("PASS %s\n",argv[1]);return 0;
 }

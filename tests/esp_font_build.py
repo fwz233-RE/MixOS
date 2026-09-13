@@ -1,14 +1,24 @@
 """Preserve the known deployed ESP app, cross-build, and record font-fix artifacts.
 
 Local-only build validation helper: never connects to or flashes a device.
+
+The toolchain layout comes from tools/idf_env.py, and the WSL launcher from
+tests/_support.py, so no machine name, user name or absolute project path is
+written down here.
 """
 import argparse
 import hashlib
 import json
-from pathlib import Path
 import subprocess
+import sys
+from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _support import ROOT, host_command, posix_path  # noqa: E402
+
+sys.path.insert(0, str(ROOT / "tools"))
+import idf_env  # noqa: E402
+
 APP = ROOT / "firmware/esp32s3/build/mixos_esp32s3.bin"
 DEST = ROOT / "build/esp32s3"
 OLD_SHA = "9593904eab8c1bcaaef9c383abc9a5308ae4beeece94989436360289eafc675b"
@@ -65,8 +75,6 @@ def app_slot():
     Under the A/B table a slot is 0x1F0000, so a literal would quietly accept an
     image that overflows the slot it is about to be written into.
     """
-    import sys
-    sys.path.insert(0, str(ROOT / "tools"))
     import update_esp
 
     table = APP.parent / "partition_table/partition-table.bin"
@@ -90,17 +98,17 @@ def report():
         raise RuntimeError("Application did not change")
     if current["bytes"] > slot["bytes"] or APP.read_bytes()[0] != 0xE9:
         raise RuntimeError("App image signature/partition size validation failed")
-    wsl_base = "/mnt/d/TheEndDEvice/MixOS"
-    image = subprocess.check_output([
-        "wsl.exe", "-d", "Ubuntu-22.04", "--",
-        wsl_base + "/.tools/idf-tools/python_env/idf5.4_py3.10_env/bin/python", "-m", "esptool",
-        "--chip", "esp32s3", "image_info", wsl_base + "/firmware/esp32s3/build/mixos_esp32s3.bin"], text=True)
+    wsl_base = posix_path(ROOT)
+    paths = idf_env.idf_paths(ROOT)
+    image = subprocess.check_output(host_command([
+        paths["python"], "-m", "esptool",
+        "--chip", "esp32s3", "image_info",
+        wsl_base + "/firmware/esp32s3/build/mixos_esp32s3.bin"]), text=True)
     if "Checksum:" not in image or "Validation Hash:" not in image or image.count("(valid)") != 2:
         raise RuntimeError("esptool did not validate the application checksum and embedded hash")
-    symbols = subprocess.check_output([
-        "wsl.exe", "-d", "Ubuntu-22.04", "--", wsl_base +
-        "/.tools/idf-tools/tools/xtensa-esp-elf/esp-14.2.0_20241119/xtensa-esp-elf/bin/xtensa-esp32s3-elf-nm",
-        "--defined-only", wsl_base + "/firmware/esp32s3/build/mixos_esp32s3.elf"], text=True)
+    symbols = subprocess.check_output(host_command([
+        paths["compiler_bin"] + "/xtensa-esp32s3-elf-nm",
+        "--defined-only", wsl_base + "/firmware/esp32s3/build/mixos_esp32s3.elf"]), text=True)
     expected = {"ttf_font_init", "ttf_font_deinit", "ttf_draw_cell", "FT_New_Memory_Face"}
     linked = [line for line in symbols.splitlines() if line.split()[-1:] and line.split()[-1] in expected]
     if {line.split()[-1] for line in linked} != expected:
@@ -148,16 +156,9 @@ if __name__ == "__main__":
     else:
         preserve()
         preserve_candidate()
-        base = "/mnt/d/TheEndDEvice/MixOS"
-        command = (f"export IDF_PATH={base}/.tools/esp-idf-clean "
-                   f"IDF_TOOLS_PATH={base}/.tools/idf-tools "
-                   f"IDF_PYTHON_ENV_PATH={base}/.tools/idf-tools/python_env/idf5.4_py3.10_env && "
-                   f"export PATH={base}/.tools/idf-tools/python_env/idf5.4_py3.10_env/bin:"
-                   f"{base}/.tools/idf-tools/tools/xtensa-esp-elf/esp-14.2.0_20241119/xtensa-esp-elf/bin:"
-                   "/home/fwz233/bin:/usr/local/bin:/usr/bin:/bin && "
-                   f"cd {base}/firmware/esp32s3 && python {base}/.tools/esp-idf-clean/tools/idf.py build")
-        result = subprocess.run(["wsl.exe", "-d", "Ubuntu-22.04", "--", "bash", "-lc", command],
+        result = subprocess.run(host_command(["bash", "-lc", idf_env.build_command(ROOT)]),
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        DEST.mkdir(parents=True, exist_ok=True)
         (DEST / "font-app-build.log").write_bytes(result.stdout)
         print(result.stdout.decode("utf-8", errors="replace"))
         if result.returncode:

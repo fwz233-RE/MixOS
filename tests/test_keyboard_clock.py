@@ -1,16 +1,17 @@
 """Preprocess pinned F042 clock configuration; never build/flash a target.
 
-Uses native cc and the local pinned QMK checkout (QMK_HOME can override it).
-No dependency source or existing target artifact is modified.
+Uses a POSIX preprocessor (local cc on Linux, WSL cc on Windows) and the local
+pinned QMK checkout, which QMK_HOME can override. No dependency source or
+existing target artifact is modified.
 """
 import os
 from pathlib import Path
 import shlex
-import shutil
 import subprocess
 import unittest
 
-ROOT = Path(__file__).resolve().parents[1]
+from _support import ROOT, host_command, posix_path, require_host_cc
+
 KEYBOARD = ROOT / "firmware/keyboard"
 QMK = Path(os.environ.get("QMK_HOME", ROOT / ".tools/qmk-0.28.0"))
 BOARD = QMK / "platforms/chibios/boards/GENERIC_STM32_F042X6"
@@ -19,9 +20,7 @@ HAL = QMK / "lib/chibios/os/hal/ports/STM32"
 
 class KeyboardClockTests(unittest.TestCase):
     def preprocess(self, source, local_override=True):
-        compiler = shlex.split(os.environ.get("CC", "cc"))
-        if not compiler or not shutil.which(compiler[0]):
-            self.skipTest("Native preprocessor unavailable; use WSL cc")
+        compiler = shlex.split(os.environ.get("CC", "")) or [require_host_cc()]
         self.assertTrue((BOARD / "configs/mcuconf.h").is_file(),
                         "Initialize pinned QMK/ChibiOS or set QMK_HOME")
         includes = ([KEYBOARD] if local_override else []) + [
@@ -34,9 +33,10 @@ class KeyboardClockTests(unittest.TestCase):
         # oscillator capabilities and all clock calculations are real headers.
         command = compiler + ["-E", "-P", "-x", "c", "-DTRUE=1", "-DFALSE=0",
                               "-DOSAL_IRQ_IS_VALID_PRIORITY(n)=((n)>=0 && (n)<4)"]
-        command += ["-I" + str(path) for path in includes]
-        return subprocess.run(command + ["-"], input=source, capture_output=True,
-                              text=True, timeout=30)
+        command += ["-I" + posix_path(path) for path in includes]
+        return subprocess.run(host_command(command + ["-"]), input=source,
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=180)
 
     def test_effective_f042_clock_tree(self):
         source = '''

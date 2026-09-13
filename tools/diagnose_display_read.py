@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """One bounded read-only diagnostic; never erases/programs flash or retries reads."""
 import argparse
-import fcntl
 import hashlib
 import json
 import os
@@ -11,6 +10,7 @@ import subprocess
 import sys
 import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _mixlib.guards import device_lock
 import display_transport as transport
 
 
@@ -34,7 +34,9 @@ def main():
     if not a.execute_read:
         print('DRY RUN: 256KiB read only; no port opened')
         return
-    if os.geteuid() == 0:
+    # os.geteuid does not exist on Windows; the attribute lookup used to raise
+    # AttributeError instead of the clear refusal below.
+    if getattr(os, 'geteuid', lambda: 0)() == 0:
         raise ValueError('Run as ordinary user')
     a.workdir.mkdir(mode=0o700, exist_ok=False)
     cache = Path.home() / '.cache/mixos'
@@ -47,8 +49,7 @@ def main():
     def expired(*_):
         raise TimeoutError('Bounded diagnostic deadline; no retry')
     signal.signal(signal.SIGALRM, expired)
-    with (cache / 'flash.lock').open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with device_lock(cache / 'flash.lock'):
         env = transport.prepare(a.package, a.workdir / '.esptool')
         sys.path.insert(0, env['PYTHONPATH'])
         import esptool

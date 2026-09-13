@@ -8,7 +8,7 @@ import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'linux'))
 from protocol import (Frame, Decoder, ReceiveEpoch, Credit, cobs_encode,
-                      cobs_decode, decode, newer, MAX_ENCODED, HEADER)
+                      cobs_decode, decode, newer, MAX_ENCODED)
 
 # Shared deterministic vectors for the portable C codec. Wire includes delimiter.
 GOLDEN_HELLO = '02010201057856341201010102010101020401020206103b55d14a00'

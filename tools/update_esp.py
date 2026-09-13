@@ -115,6 +115,34 @@ def parse_partition_binary(data):
     return rows
 
 
+def encode_partition_binary(rows, size=0xC00):
+    """Build a 0xC00-byte partition-table image from validate_partitions rows.
+
+    The inverse of parse_partition_binary. Tests need real tables rather than
+    a block of filler bytes: a fixture that cannot be parsed exercises the
+    "unreadable table" path instead of the layout checks it means to cover.
+    """
+    types = {name: value for value, name in PARTITION_TYPES.items()}
+    subtypes = {(kind, name): value for (kind, value), name in PARTITION_SUBTYPES.items()}
+    image = bytearray()
+    for name, kind, subtype, offset, length in rows:
+        if kind not in types:
+            raise ValueError(f'unsupported partition type {kind!r}')
+        if (kind, subtype) not in subtypes:
+            raise ValueError(f'unsupported subtype {kind}/{subtype}')
+        label = name.encode('ascii')
+        if len(label) > 16:
+            raise ValueError(f'partition name too long: {name!r}')
+        image += PARTITION_MAGIC
+        image += bytes([types[kind], subtypes[(kind, subtype)]])
+        image += struct.pack('<II', offset, length)
+        image += label.ljust(16, b'\0')
+        image += struct.pack('<I', 0)
+    if len(image) > size:
+        raise ValueError('partition table does not fit')
+    return bytes(image).ljust(size, b'\xff')
+
+
 def identify_partition_binary(data, expect=None):
     """Name the layout a live partition-table image implements."""
     rows = parse_partition_binary(data)

@@ -1,29 +1,31 @@
-"""Native keyboard tests; run with WSL cc or set CC to a C11 compiler."""
+"""Native keyboard tests.
+
+The C sources are compiled with a POSIX toolchain: the local compiler on Linux,
+or the one inside WSL on Windows. tests/_support.py finds it and translates
+paths, so these no longer skip on a Windows machine that has WSL installed.
+"""
 import json
 import os
 from pathlib import Path
 import shlex
-import shutil
-import subprocess
 import tempfile
 import unittest
 
-ROOT = Path(__file__).resolve().parents[1]
+from _support import ROOT, host_run, posix_path, require_host_cc
+
 KBD = ROOT / "firmware/keyboard"
 ESP = ROOT / "firmware/esp32s3/main"
 
 class KeyboardNativeTests(unittest.TestCase):
     def compile_run(self, sources, includes):
-        compiler = shlex.split(os.environ.get("CC", "cc"))
-        if not shutil.which(compiler[0]):
-            self.skipTest("C11 compiler unavailable; use WSL Ubuntu-22.04 cc")
+        compiler = shlex.split(os.environ.get("CC", "")) or [require_host_cc()]
         with tempfile.TemporaryDirectory(prefix="mix-keyboard-") as tmp:
-            executable = str(Path(tmp) / "test")
+            executable = posix_path(Path(tmp) / "test")
             command = compiler + ["-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic", "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g"]
-            command += ["-I" + str(path) for path in includes]
-            command += [str(path) for path in sources] + ["-o", executable]
-            subprocess.run(command, check=True, timeout=90)
-            subprocess.run([executable], check=True, timeout=30)
+            command += ["-I" + posix_path(path) for path in includes]
+            command += [posix_path(path) for path in sources] + ["-o", executable]
+            host_run(command)
+            host_run([executable])
 
     def test_portable_input(self):
         self.compile_run([ROOT / "tests/test_input.c", ESP / "mix_input.c"], [ESP])

@@ -187,9 +187,9 @@ def main(argv=None):
         if status:
             print(f'\ndeploy_ota: the update did not complete (exit {status}). The device is '
                   f'still running its previous build; {SERVICE} was restarted.', file=sys.stderr)
-            print(f'deploy_ota: if it timed out waiting for OTA_READY, the running firmware '
-                  f'predates USB updates. Install it once with '
-                  f'tools/deploy_display.py --stage --migrate, then this tool works from then on.',
+            print('deploy_ota: if it timed out waiting for OTA_READY, the running firmware '
+                  'predates USB updates. Install it once with '
+                  'tools/deploy_display.py --stage --migrate, then this tool works from then on.',
                   file=sys.stderr)
             print('receipt ' + str(receipt), file=sys.stderr)
             return status

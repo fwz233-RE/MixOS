@@ -11,6 +11,7 @@ import hashlib
 from pathlib import Path
 import struct
 import sys
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -266,16 +267,25 @@ class RefusalTests(unittest.TestCase):
 
 
 class ImageTests(unittest.TestCase):
+    """Image validation, with fixtures in a temporary directory.
+
+    These used to be written into the tracked ``build/scratch`` folder, which
+    left files behind and let one run observe another run's leftovers.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix='mixos-ota-image-')
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+
     def test_rejects_an_elf_or_merged_image(self):
-        path = ROOT / 'build/scratch/not-an-app.bin'
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path = self.tmp / 'not-an-app.bin'
         path.write_bytes(b'\x7fELF' + bytes(2000))
         with self.assertRaises(ota_esp.UpdateError):
             ota_esp.inspect_image(path)
 
     def test_rejects_another_chip(self):
-        path = ROOT / 'build/scratch/wrong-chip.bin'
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path = self.tmp / 'wrong-chip.bin'
         data = bytearray(image(2048))
         struct.pack_into('<H', data, 12, 5)
         path.write_bytes(bytes(data))
@@ -283,8 +293,7 @@ class ImageTests(unittest.TestCase):
             ota_esp.inspect_image(path)
 
     def test_accepts_an_esp32s3_application(self):
-        path = ROOT / 'build/scratch/app.bin'
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path = self.tmp / 'app.bin'
         data = image(4096)
         path.write_bytes(data)
         loaded, digest = ota_esp.inspect_image(path)

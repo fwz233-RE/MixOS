@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
+# Build the ESP32-S3 application with the vendored ESP-IDF toolchain.
+#
+# The repository root is derived from this script's own location, so the file
+# works from any checkout. It used to begin with ROOT="/mnt/d/TheEndDEvice/MixOS",
+# which meant it only ran on one machine, under WSL, at one path.
+#
+# The toolchain layout itself lives in tools/idf_env.py so that this script,
+# the Python build driver and the documentation cannot drift apart.
 set -euo pipefail
 
-ROOT="/mnt/d/TheEndDEvice/MixOS"
-IDF="$ROOT/.tools/esp-idf-clean"
-VENV="$ROOT/.tools/idf-tools/python_env/idf5.4_py3.10_env"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT="$ROOT/firmware/esp32s3"
 
-export IDF_PATH="$IDF"
-export IDF_TOOLS_PATH="$ROOT/.tools/idf-tools"
-export IDF_PYTHON_ENV_PATH="$VENV"
-export ESP_ROM_ELF_DIR="$ROOT/.tools/idf-tools/tools/esp-rom-elfs/20241011"
-export IDF_SKIP_CHECK_SUBMODULES=1
-export PATH="$ROOT/.tools/idf-tools/tools/xtensa-esp-elf/esp-14.2.0_20241119/xtensa-esp-elf/bin:$ROOT/.tools/idf-tools/tools/cmake/3.30.2/bin:$ROOT/.tools/idf-tools/tools/ninja/1.12.1:$PATH"
+PYTHON="${MIXOS_PYTHON:-python3}"
+eval "$("$PYTHON" "$ROOT/tools/idf_env.py" --shell)"
 
 if [[ "${1:-}" == "--clean" ]]; then
     rm -rf "$PROJECT/build"
@@ -23,7 +25,7 @@ if [[ $# -ne 0 ]]; then
 fi
 
 cd "$PROJECT"
-"$VENV/bin/python" "$IDF/tools/idf.py" build
+"$IDF_PYTHON_ENV_PATH/bin/python" "$IDF_PATH/tools/idf.py" build
 
 for artifact in \
     build/mixos_esp32s3.bin \

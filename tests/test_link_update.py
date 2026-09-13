@@ -1,10 +1,8 @@
 """Run production maintenance handling with local SDK stubs; never use hardware."""
-import os
-from pathlib import Path
-import subprocess
 import unittest
 
-ROOT = Path(__file__).resolve().parents[1]
+from _support import ROOT, host_run, posix_path, require_host_cc
+
 OUT = ROOT / "build/host-link-update"
 HEADERS = {
     # The numeric values are ESP-IDF's own. mix_link.c distinguishes an
@@ -25,59 +23,62 @@ HEADERS = {
 
 
 def linux(path):
-    text = str(path)
-    return "/mnt/" + text[0].lower() + text[2:].replace("\\", "/") if os.name == "nt" else text
+    return posix_path(path)
 
 
 def execute(args):
-    if os.name == "nt":
-        args = ["wsl.exe", "-d", "Ubuntu-22.04", "-u", "fwz233", "--", *args]
-    # GCC quotes identifiers with U+2018/U+2019, which the Windows ANSI code
-    # page cannot decode. Without an explicit UTF-8 read the diagnostic is lost
-    # to a UnicodeDecodeError and the failure reports an empty compiler log.
-    result = subprocess.run(args, capture_output=True, text=True,
-                            encoding="utf-8", errors="replace")
-    if result.returncode:
-        raise AssertionError(f"Command failed: {args}\n{result.stdout}{result.stderr}")
-    return result.stdout
+    return host_run(args)
 
 
 class LinkUpdateTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cc = require_host_cc()
         OUT.mkdir(parents=True, exist_ok=True)
         for name, contents in HEADERS.items():
             dest = OUT / "stubs" / name
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(contents, encoding="utf-8")
         cls.exe = OUT / "link_update_harness"
-        execute(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-misleading-indentation",
+        execute([cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-misleading-indentation",
                  "-g", "-O1", "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-no-pie",
                  "-I" + linux(OUT / "stubs"), linux(ROOT / "tests/test_link_update_host.c"),
                  linux(ROOT / "firmware/esp32s3/main/mix_protocol.c"),
                  linux(ROOT / "firmware/esp32s3/main/mix_terminal.c"), "-lm", "-o", linux(cls.exe)])
 
+    def scenario(self, name):
+        """Assert on the harness's own per-scenario verdict.
+
+        The harness prints ``PASS <scenario>`` for each case it completes and
+        exits non-zero on any failed check. Matching the scenario name means a
+        harness that silently skipped a case can no longer report success:
+        the previous ``assertIn("passed", ...)`` was true for any zero exit.
+        """
+        output = execute([linux(self.exe), name])
+        self.assertIn(f"PASS {name}", output, msg=output)
+        return output
+
     def test_host_request_without_ui_answer(self):
-        self.assertIn("passed", execute([linux(self.exe), "automatic"]))
+        self.scenario("automatic")
 
     def test_malformed_offline_wrong_epoch_and_session(self):
-        self.assertIn("passed", execute([linux(self.exe), "invalid"]))
+        self.scenario("invalid")
 
     def test_grant_expiry_and_timer_wrap(self):
-        self.assertIn("passed", execute([linux(self.exe), "expiry"]))
+        self.scenario("expiry")
 
     def test_single_use_and_replayed_sequence(self):
-        self.assertIn("passed", execute([linux(self.exe), "replay"]))
+        self.scenario("replay")
 
     def test_disconnect_and_restart_revoke_grant(self):
-        self.assertIn("passed", execute([linux(self.exe), "reset"]))
+        self.scenario("reset")
 
     def test_queue_failure_never_grants(self):
-        self.assertIn("passed", execute([linux(self.exe), "queue"]))
+        self.scenario("queue")
 
     def test_ota_transfer_resync_refusal_and_teardown(self):
         """The in-protocol A/B update: the path that removes esptool reflashing."""
-        self.assertIn("passed", execute([linux(self.exe), "ota"]))
+        self.scenario("ota")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 """Hardware-free font updater boundary and backup checks."""
 import hashlib
-import importlib.util
+import inspect
 from pathlib import Path
 import struct
 import sys
@@ -10,14 +10,14 @@ import json
 import shlex
 import subprocess
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
 
 TOOLS = Path(__file__).resolve().parents[1] / 'tools'
 sys.path.insert(0, str(TOOLS))
-if sys.platform == 'linux':
-    import flash_font_on_pi as updater
+import flash_font_on_pi as updater
 
 
 def font():
@@ -42,7 +42,6 @@ def partition_table(layout='legacy'):
     return (entries + md5).ljust(0xc00, b'\xff')
 
 
-@unittest.skipUnless(sys.platform == 'linux', 'Pi-side updater requires Linux')
 class FontUpdateTests(unittest.TestCase):
     def validate(self, data):
         return updater.validate_font(data, hashlib.sha256(data).hexdigest())
@@ -321,7 +320,6 @@ class FakeChip:
         self.resets += 1
 
 
-@unittest.skipUnless(sys.platform == 'linux', 'Pi-side updater requires Linux')
 class FontSessionTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -557,14 +555,27 @@ class FontSessionTests(unittest.TestCase):
                 chip._port.close.assert_called_once()
 
     def test_operation_timer_raises_without_retry(self):
-        with mock.patch.object(updater.signal, 'signal', return_value=updater.signal.SIG_DFL) as install, \
-                mock.patch.object(updater.signal, 'setitimer') as timer:
-            with updater.operation_timeout('test read', 60):
-                handler = install.call_args.args[1]
-                with self.assertRaises(TimeoutError):
-                    handler(updater.signal.SIGALRM, None)
-            self.assertEqual(timer.call_args_list[0].args, (updater.signal.ITIMER_REAL, 60))
-            self.assertEqual(timer.call_args_list[-1].args, (updater.signal.ITIMER_REAL, 0))
+        """The bound is real where SIGALRM exists, and never silently swallows errors.
+
+        This used to patch signal.signal/setitimer directly, which made the
+        test itself unable to run on a platform without SIGALRM  -- the same
+        platform where the implementation had been quietly broken.
+        """
+        from _mixlib import guards
+
+        if guards.timeouts_enforced():
+            with self.assertRaises(TimeoutError):
+                with guards.operation_timeout('test read', 0.05):
+                    time.sleep(2)
+        else:
+            self.skipTest('SIGALRM timers are unavailable on this platform')
+
+    def test_operation_timeout_propagates_the_bodys_own_error(self):
+        from _mixlib import guards
+
+        with self.assertRaises(ZeroDivisionError):
+            with guards.operation_timeout('test read', 30):
+                1 / 0
 
     def test_backup_durability_failure_prevents_erase(self):
         chip = FakeChip(self.before)
@@ -575,7 +586,6 @@ class FontSessionTests(unittest.TestCase):
         self.assertEqual(chip.resets, 0)
 
 
-@unittest.skipUnless(sys.platform == 'linux', 'Pi-side updater requires Linux')
 class DirectAuthorizationTests(unittest.TestCase):
     def setUp(self):
         self.app = {'vid': '303a', 'pid': '80c3', 'serial': 'TD0720', 'location': '5-1.2'}
@@ -657,7 +667,6 @@ class DirectAuthorizationTests(unittest.TestCase):
         local_confirmation.assert_not_called()
 
 
-@unittest.skipUnless(sys.platform == 'linux', 'Pi-side updater requires Linux')
 class ResumeNoWriteTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -845,7 +854,9 @@ class ResumeNoWriteTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 3, 'inactive\n')
             return self.status
         with mock.patch.object(sys, 'argv', argv), \
-                mock.patch.object(updater.os, 'geteuid', return_value=1000), \
+                mock.patch.object(sys, 'platform', 'linux'), \
+                mock.patch.object(updater, 'device_lock', mock.MagicMock()), \
+                mock.patch.object(updater.os, 'geteuid', return_value=1000, create=True), \
                 mock.patch.object(updater.Path, 'home', return_value=self.base), \
                 mock.patch.object(updater, 'validate_image'), \
                 mock.patch.object(updater, 'validate_partitions', return_value={}), \
@@ -877,9 +888,17 @@ class ResumeNoWriteTests(unittest.TestCase):
             self.assertFalse(self.destination.exists())
             return
         session.assert_called_once()
-        self.assertEqual(session.call_args.args[:2], ('/dev/fake', self.rom))
-        self.assertEqual(session.call_args.args[-1], b'new-app')
-        self.assertEqual(session.call_args.kwargs, {'reset_rom': False})
+        # Bind the arguments by name. Indexing args[-1] silently started
+        # reading the `bootloader` parameter when it was added, and the
+        # assertion could not fail on a machine where this test never ran.
+        bound = inspect.signature(updater.session).bind(
+            *session.call_args.args, **session.call_args.kwargs)
+        bound.apply_defaults()
+        self.assertEqual((bound.arguments['dev'], bound.arguments['identity']),
+                         ('/dev/fake', self.rom))
+        self.assertEqual(bound.arguments['new_app'], b'new-app')
+        self.assertIsNone(bound.arguments['bootloader'])
+        self.assertIs(bound.arguments['reset_rom'], False)
         self.assertEqual((self.source / 'resume-claim.json').is_file(), mode == 'resume')
         self.assertTrue((self.destination / 'font-job-claim.json').is_file())
         authorization = audit.call_args_list[0]

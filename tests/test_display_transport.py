@@ -14,11 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 import deploy_display as deploy
 import display_transport as transport
-if sys.platform == 'linux':
-    import flash_font_on_pi as worker
+import flash_font_on_pi as worker
 
 
-@unittest.skipUnless(sys.platform == 'linux', 'Pi worker requires Linux')
 class DisplayTransportTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -106,7 +104,12 @@ class DisplayTransportTests(unittest.TestCase):
             worker.prepare_esptool(self.wheel())
         self.assertEqual(worker.esp.ESP_ENV['ESPTOOL_CFGFILE'], str(config))
         self.assertNotIn('ESPRESSIF_IDE_WS', worker.esp.ESP_ENV)
-        self.assertEqual(config.parent.stat().st_mode & 0o777, 0o700)
+        if os.name == 'posix':
+            # Windows ignores the POSIX permission bits, so the private-mode
+            # check is meaningful only where the tool actually runs. The rest
+            # of the assertions above are platform independent and now run
+            # everywhere instead of being skipped with them.
+            self.assertEqual(config.parent.stat().st_mode & 0o777, 0o700)
 
     def test_bulk_read_deadlines_and_write_retry_boundary_unchanged(self):
         self.assertEqual(worker.PORT_TIMEOUT, 10)

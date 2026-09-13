@@ -14,7 +14,6 @@ Two operations:
 Fails closed on identity/layout/security/backup mismatch; never erases the chip.
 """
 import argparse
-import fcntl
 import hashlib
 import json
 import os
@@ -28,6 +27,10 @@ import time
 import zipfile
 
 ESP_ENV = None
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _mixlib.guards import device_lock
+from _mixlib.durable import fsync_file
 
 from update_esp import (validate_image, validate_partitions, physical_identity, Maintenance,
                         identify_partition_binary)
@@ -212,8 +215,7 @@ def flash_session(dev, identity, image, table, digest, bootloader=None, migrate=
         command('read_flash', '0x0', '0x800000', str(backup), '--no-progress')
         data = backup.read_bytes()
         live = verify_snapshot(data, table, migrate)
-        with backup.open('rb') as saved:
-            os.fsync(saved.fileno())
+        fsync_file(backup)
         audit('backup_and_layout_verified', file=str(backup), live_layout=live['name'],
               sha256=hashlib.sha256(data).hexdigest(), bytes=len(data))
         if physical_identity(dev) != identity:
@@ -400,8 +402,7 @@ def main():
         dev, ident = candidates[0]
     lockdir = Path.home() / '.cache/mixos'
     lockdir.mkdir(parents=True, exist_ok=True)
-    with (lockdir / 'flash.lock').open('w') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with device_lock(lockdir / 'flash.lock'):
         audit('preflight_ok', device=dev, identity=ident, app_sha256=a.sha256, mode=a.boot_mode,
               operation='migrate' if a.migrate else 'app_only')
         if a.esptool_wheel_sha256:
