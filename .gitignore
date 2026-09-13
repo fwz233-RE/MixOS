@@ -1,10 +1,47 @@
-# Generated and local files
+# ---------------------------------------------------------------------------
+# MixOS .gitignore
+#
+# Rule of thumb: everything that a documented command can regenerate stays out
+# of the repository. Everything a human wrote, or that pins a reproducible
+# input (lock files, checksums, charsets), stays in.
+# ---------------------------------------------------------------------------
+
+# --- Build outputs ---------------------------------------------------------
 build/
+firmware/esp32s3/build/
+firmware/keyboard/.build/
+*.o
+*.obj
+*.elf
+*.map
+
+# --- Vendored toolchains and downloaded dependencies -----------------------
+# .tools/ holds ESP-IDF, the IDF tool bundle and the pinned QMK checkout.
+# firmware/esp32s3/managed_components/ is restored by `idf.py reconfigure`
+# from firmware/esp32s3/dependencies.lock, which IS tracked.
 .tools/
+firmware/esp32s3/managed_components/
+
+# --- Generated Kconfig output ----------------------------------------------
+# sdkconfig is derived from the tracked sdkconfig.defaults.
+firmware/esp32s3/sdkconfig
+firmware/esp32s3/sdkconfig.old
+
+# --- Prebuilt firmware images ----------------------------------------------
+# Historical flash images are large and reproducible from a tagged source
+# tree. The flashing scripts next to them are tracked.
+*.bin
+!firmware/esp32s3/fonts/*.bin
+
+# --- Python ----------------------------------------------------------------
 **/__pycache__/
 *.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# --- Editors and logs ------------------------------------------------------
 .vscode/
 .idea/
 *.log
-firmware/esp32s3/build/
-firmware/keyboard/.build/
+*.jsonl

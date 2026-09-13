@@ -1,0 +1,35 @@
+# MixOS A/B OTA partition table (ESP32-S3, 8 MiB flash).
+#
+# This table is designed so the one-time migration away from the historic
+# factory-only layout rewrites as little as possible. Compared to the old
+# table, nvs and phy_init keep their exact offsets AND sizes, so the stored
+# language/brightness preferences survive, and font keeps offset 0x210000 and
+# 4 MiB, so the 4 MiB MiSans image is never rewritten.
+#
+# The only regions the migration touches are the partition table itself, the
+# application, and the two otadata sectors. otadata deliberately sits at
+# 0x200000 instead of the usual 0xd000: that address is inside the tail of the
+# old 2 MiB factory partition, which is being replaced anyway, whereas 0xd000
+# would land inside the old nvs partition and destroy the stored settings.
+#
+# ota_0 and ota_1 are the same size, so either slot accepts any build. With
+# erased (all-0xFF) otadata and no factory partition the ROM bootloader boots
+# ota_0 and writes ota_seq=1 itself, which is exactly what the migration wants.
+#
+# Layout map:
+#   0x000000 bootloader
+#   0x008000 partition table
+#   0x009000 nvs        24 KiB  (unchanged from the factory-only layout)
+#   0x00f000 phy_init    4 KiB  (unchanged from the factory-only layout)
+#   0x010000 ota_0    1984 KiB
+#   0x200000 otadata     8 KiB  (two mirrored sectors, required by esp_ota)
+#   0x210000 font        4 MiB  (raw sfnt TrueType, esp_partition_mmap)
+#   0x610000 ota_1    1984 KiB  (ends exactly at 0x800000)
+#
+# Name,    Type, SubType, Offset,   Size
+nvs,       data, nvs,     0x9000,   0x6000
+phy_init,  data, phy,     0xf000,   0x1000
+ota_0,     app,  ota_0,   0x10000,  0x1F0000
+otadata,   data, ota,     0x200000, 0x2000
+font,      data, spiffs,  0x210000, 0x400000
+ota_1,     app,  ota_1,   0x610000, 0x1F0000

@@ -5,7 +5,12 @@ enable_testing()
 set(ESP ../firmware/esp32s3/main)
 add_executable(test_core test_core.c ${ESP}/mix_protocol.c ${ESP}/mix_terminal.c)
 target_include_directories(test_core PRIVATE ${ESP})
-if(NOT MSVC)
+# Clang on Windows can use the GNU-style driver while still targeting the
+# Windows linker.  Detect the platform rather than the compiler front-end so
+# we do not pass the Unix-only libm name to lld-link.
+if(WIN32)
+  target_compile_options(test_core PRIVATE -Wall -Wextra -Wpedantic)
+else()
   target_compile_options(test_core PRIVATE -Wall -Wextra -Wpedantic)
   target_link_libraries(test_core m)
 endif()

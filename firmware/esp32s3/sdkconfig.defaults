@@ -1,0 +1,75 @@
+# TypixDeck 0720 — ESP32-S3-PICO-1-N8R8 (8MB Quad Flash + 8MB Octal PSRAM)
+CONFIG_IDF_TARGET="esp32s3"
+
+# Flash：自动探测会误报 2MB，强制 8MB（见 CLAUDE.md 踩坑）
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+# Flash 与 PSRAM 共享 MSPI 核心时钟，PSRAM 120M 时 Flash 也必须 120M
+CONFIG_ESPTOOLPY_FLASHFREQ_120M=y
+
+# PSRAM：八线超频 120MHz（官方实验特性），RGB framebuffer 放这里。
+# 实测 80MHz 时带宽 ~100MB/s，48/53MHz PCLK（需 96/106MB/s）每帧欠载 →
+# 驱动每帧重启 DMA，帧率被压回 ~29fps；120MHz 提升 50% 带宽解除瓶颈
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_120M=y
+# 代码/rodata 搬 PSRAM 执行（XIP）：flash 读写期间 cache 不再关闭。
+# 没有它，NVS 任何读写（语言设置落盘）都会撞上 RGB LCD bounce ISR 访问
+# PSRAM 帧缓冲 → "Cache disabled but cached memory region accessed" 死循环
+# （2026-08-16 实翻车，官方文档对该组合的指定解法）
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=n
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+
+# 数据 cache 拉满，提高 PSRAM 吞吐
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+
+# CPU 240MHz，喂饱 RGB bounce buffer 的 memcpy
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# RGB LCD ISR 放 IRAM，防止 flash 操作时断流
+CONFIG_LCD_RGB_ISR_IRAM_SAFE=y
+
+CONFIG_FREERTOS_HZ=1000
+# FreeType 光栅化在 app_main 栈上跑（gray raster 需 ~16-32KB，
+# 8KB 时画大字号栈溢出踩堆 → IDLE 任务 LoadProhibited 崩溃，2026-08-16 实翻车）
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
+
+# esp_codec_dev 用新 I2C master API
+CONFIG_CODEC_I2C_BACKWARD_COMPATIBLE=n
+
+# ---- USB UAC-only（先验证出声；CDC composite 稍后加回）----
+# non-AS_PART：用组件自带 tusb_config.h + usb_descriptors.c（跟官方 example /
+# ~/esp/s32_uac1_speaker 同一路径）。AS_PART+CDC 曾枚举成功但 audio EP 不收数据。
+# CONFIG_USB_DEVICE_UAC_AS_PART 默认 n，不要写 =y
+# 立体声放音（主机→ES8389），不做 USB 麦
+CONFIG_UAC_SPEAKER_CHANNEL_NUM=2
+CONFIG_UAC_MIC_CHANNEL_NUM=2
+CONFIG_UAC_SAMPLE_RATE=48000
+CONFIG_UAC_BIT_RESOLUTION_16=y
+# ESP32-S3 内置 PHY 是 Full-Speed：UAC 异步反馈必须用 10.14 格式（3 字节），
+# 默认 16.16（4 字节）会被主机拒 → 开流失败。开这个做 FS 反馈格式转换。
+CONFIG_UAC_SUPPORT_MACOS=y
+CONFIG_UAC_TUSB_VID=0x303A
+CONFIG_UAC_TUSB_PID=0x80C3
+CONFIG_UAC_TUSB_MANUFACTURER="TypixDeck"
+CONFIG_UAC_TUSB_PRODUCT="TypixDeck UAC+CDC"
+CONFIG_UAC_TUSB_SERIAL_NUM="TD0720"
+
+# ---- 中文 TTF 渲染（自绘 UI + FreeType，不用 LVGL）----
+# 自定义分区表：ota_0 / ota_1 各 1984KB + font 4MB（普惠体 GB2312 子集 TTF）
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---- A/B OTA（USB CDC 协议内升级，不再需要 ROM 下载模式 + esptool）----
+# 新固件首次启动时处于 PENDING_VERIFY：mix_ota 在本地 UI/USB 健康后才
+# esp_ota_mark_app_valid_cancel_rollback()。崩溃、看门狗复位或健康检查超时
+# 都会让 bootloader 自动回滚到上一个槽位，刷坏了不用拆机。
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+# 不启用防回滚（anti-rollback）：它会烧写 eFuse 安全版本，不可逆。
+CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=n
+# 每次启动都校验待运行分区的镜像摘要，OTA 写坏可以在跳转前被发现。
+CONFIG_BOOTLOADER_APP_TEST=n
+CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT=n

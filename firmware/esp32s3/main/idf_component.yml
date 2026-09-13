@@ -1,0 +1,4 @@
+dependencies:
+  idf: '==5.4.2'
+  espressif/esp_codec_dev: '==1.6.2'
+  espressif/freetype: '==2.14.3'

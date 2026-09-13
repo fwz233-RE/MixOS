@@ -1,0 +1,16 @@
+{
+  "repository": "https://github.com/qmk/qmk_firmware.git",
+  "tag": "0.28.0",
+  "commit": "a63fd7f01cdabd9ce85bb09ae2b573fd3b8e60aa",
+  "keyboard_target": "keebdeck_6r11c",
+  "keymaps": [
+    "default",
+    "diag"
+  ],
+  "verified_by": "tools/verify_qmk.py",
+  "verification_date": "2026-09-09",
+  "target_build_verified": false,
+  "hardware_verified": false,
+  "target_build_date": "2026-09-11",
+  "target_build_manifest": "build/keyboard/manifest.json"
+}

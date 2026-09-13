@@ -1,0 +1,11 @@
+menu "MixOS board verification"
+config MIXOS_STC_CALIBRATION_VERIFIED
+    bool "Board STC3117 calibration and cold-start initialization verified"
+    default n
+    help
+        Leave disabled until the actual board's gauge calibration and its
+        persistence across cold starts have been verified with ESP permanently
+        owning the I2C MUX. MixOS intentionally does not invent CC_CNF/VM_CNF.
+        When disabled raw SOC is displayed as unverified, capacity learning and
+        runtime estimates are disabled. This is not battery charging control.
+endmenu
