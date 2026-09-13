@@ -1,0 +1,2 @@
+# TypixDeck TD0720 MixOS CDC interface only. No global ttyACM permission.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="80c3", ATTRS{serial}=="TD0720", ENV{ID_USB_INTERFACE_NUM}=="03", GROUP="dialout", MODE="0660", ENV{ID_MM_DEVICE_IGNORE}="1"

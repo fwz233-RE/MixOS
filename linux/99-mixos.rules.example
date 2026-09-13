@@ -1,0 +1,3 @@
+# TEMPLATE ONLY. Fill all identities from udevadm info for YOUR CDC interface.
+# Do not match all ttyACM devices; do not use MODE=0666 or run a login as root.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="CONFIGURE_VID", ATTRS{idProduct}=="CONFIGURE_PID", ATTRS{serial}=="CONFIGURE_SERIAL", ENV{ID_USB_INTERFACE_NUM}=="CONFIGURE_CDC_INTERFACE", GROUP="CONFIGURE_SERIAL_GROUP", MODE="0660", ENV{ID_MM_DEVICE_IGNORE}="1"

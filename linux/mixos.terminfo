@@ -1,0 +1,12 @@
+# Deliberately modest: no alternate screen, mouse, truecolor, insert/delete lines.
+# Compile manually: tic -x -o ~/.terminfo linux/mixos.terminfo
+mixos|MixOS conservative 80x28 ANSI terminal,
+    am, bce, cols#80, lines#28, colors#8, pairs#64,
+    bel=^G, cr=^M, cud1=^J, cub1=^H,
+    clear=\E[2J\E[H, el=\E[K, ed=\E[J,
+    home=\E[H, cup=\E[%i%p1%d;%p2%dH,
+    cuu1=\E[A, cuf1=\E[C,
+    sgr0=\E[0m, bold=\E[1m, rev=\E[7m,
+    setaf=\E[3%p1%dm, setab=\E[4%p1%dm,
+    kbs=^?, kent=^M, kcuu1=\E[A, kcud1=\E[B,
+    kcuf1=\E[C, kcub1=\E[D,

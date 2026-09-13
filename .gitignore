@@ -1,0 +1,10 @@
+# Generated and local files
+build/
+.tools/
+**/__pycache__/
+*.pyc
+.vscode/
+.idea/
+*.log
+firmware/esp32s3/build/
+firmware/keyboard/.build/

@@ -1,0 +1,18 @@
+[Unit]
+Description=MixOS unprivileged USB terminal host
+After=local-fs.target
+
+[Service]
+Type=simple
+User=pi
+Group=dialout
+WorkingDirectory=/opt/mixos/linux
+ExecStart=/usr/bin/python3 /opt/mixos/linux/mixosd.py --device /dev/serial/by-id/usb-TypixDeck_TypixDeck_UAC+CDC_TD0720-if03 --shell /bin/bash
+Restart=on-failure
+RestartSec=2
+KillMode=control-group
+NoNewPrivileges=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

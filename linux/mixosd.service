@@ -1,0 +1,21 @@
+# TEMPLATE ONLY: operator must replace User, Group, path and device identity.
+# Never install unchanged. This is not an autologin/getty or a root shell.
+[Unit]
+Description=MixOS unprivileged USB terminal host
+After=local-fs.target
+
+[Service]
+Type=simple
+User=CONFIGURE_ORDINARY_USER
+Group=CONFIGURE_SERIAL_GROUP
+WorkingDirectory=/opt/mixos/linux
+ExecStart=/usr/bin/python3 /opt/mixos/linux/mixosd.py --device /dev/serial/by-id/CONFIGURE_EXACT_DEVICE --shell /bin/bash
+Restart=on-failure
+RestartSec=2
+KillMode=control-group
+NoNewPrivileges=yes
+UMask=0077
+# Shell has this user's normal permissions. Choose isolation suitable for your use.
+
+[Install]
+WantedBy=multi-user.target
