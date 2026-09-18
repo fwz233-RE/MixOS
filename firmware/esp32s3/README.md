@@ -1,47 +1,35 @@
-# TypixNode ESP32-S3 Firmware
+# MixOS ESP32-S3 固件
 
-ESP32-S3 coprocessor firmware for the TypixNode / TypixDeck handheld
-(Raspberry Pi CM4/CM5 based cyberdeck). This is the main production firmware
-running on the on-board ESP32-S3-PICO-1.
+本目录是 TypixDeck 掌上设备的 ESP32-S3 外设固件，与 Linux 主机及 STM32 键盘控制器协作，负责本地显示、触控、输入、设备状态和 USB 音频。
 
-## Features
+## 主要模块
 
-- **USB UAC audio**: full-speed USB sound card (48 kHz, ES8389 codec,
-  speaker / headphone with HP detect, dual microphones)
-- **USB CDC console**: debug commands and remote maintenance. The former
-  `EGGFLY_*` magic strings are gone; maintenance now travels as framed
-  messages on the protocol's maintenance channel. A framebuffer dump is
-  available there (`MIX_SCREEN_REQUEST`); see `tools/esp_screenshot.py`.
-- **LCD GUI**: 1024x768 RGB (DPI) panel dashboard with four themes,
-  Chinese/English UI (FreeType + font partition), battery / power monitoring
-- **Touch**: GT911 reset handling behind the CM/ESP display MUX
-- **System management**: AW9523B IO expander (power sequencing, safe
-  shutdown chain to the CM), INA219 / STC3117 / CW2015 gauges, RX8130 RTC,
-  QMI8658 IMU
+- **界面与终端**：1024×768 RGB 屏幕、四种主题、中英文界面、FreeType 字体及 Linux 终端文本渲染。
+- **输入**：GT911 触控、共享 I²C 总线上的 STM32 键盘事件与本地快捷键。
+- **USB**：UAC 音频与 CDC 通信复合设备；终端、维护和更新使用独立协议通道。
+- **音频**：ES8389 编解码器、双声道采集、扬声器／耳机输出与运行期恢复。
+- **设备管理**：电源时序、背光、电池与传感器状态。
+- **应用更新**：A/B 槽位、镜像校验、试运行健康确认与回滚支持。
 
-## Build
+## 构建与配置
 
-ESP-IDF v5.4.x, target `esp32s3`:
+使用 ESP-IDF 5.4.2、`esp32s3` 目标和仓库锁定的组件。板级引脚由 `main/board_pins.h` 定义，构建时需核对实际 8 MiB Flash、PSRAM、分区表和字体输入。
 
-```bash
-. $IDF_PATH/export.sh
-idf.py set-target esp32s3
-idf.py build
-```
+请从根目录的[构建指南](../../docs/BUILD.md)开始。当前发布构建驱动依赖本地恢复基线与字体材料，公开检出不能直接复用其他设备的恢复证据。单独 `idf.py build` 不会生成发布包所需的完整来源记录。
 
-Note: flash size must be set manually to 8 MB
-(`CONFIG_ESPTOOLPY_FLASHSIZE="8MB"`); auto-detection misreads it as 2 MB.
+## 更新与恢复
 
-## Flash
+正常更新使用 [A/B 更新工具](../../docs/ESP_OTA.md)，无需进入 ROM 下载模式或按 BOOT。固件不再接受旧的串口魔串命令。
 
-- Normal (firmware alive): write `EGGFLY_REBOOT_TO_BOOT_MODE\n` to the CDC
-  port, then flash with esptool (auto hard-reset applies).
-- Bricked firmware: hold the side ESP32 BOOT button (SW3), tap RESET (SW1),
-  flash, then press RESET again to leave download mode.
+首次安装、分区迁移和应用失联后的恢复是独立维护流程，要求明确设备身份、完整备份及可用的恢复通道。自动复位能力取决于硬件连接，不能假定 CDC 存在就能救回完全卡死的设备。参见[主机维护授权](../../docs/ESP_HOST_UPDATE.md)和[恢复说明](../../docs/ESP32_RECOVERY_FLASH.md)。
 
-Prebuilt images are under `release/`.
+## 相关文档
 
-## License
+- [系统接口](../../docs/IMPLEMENTATION.md)与[界面实现](../../docs/ui-implementation.md)
+- [音频硬件](../../docs/AUDIO_HARDWARE_NOTES.md)
+- [USB 协议](../../protocol/USB_V1.md)与[A/B 更新协议](../../protocol/OTA_V2.md)
+- [测试指南](../../docs/TESTING.md)
 
-MIT — see [LICENSE](LICENSE). Third-party components under `components/` and
-`managed_components/` keep their own licenses.
+## 许可证
+
+本目录继承的许可见 [LICENSE](LICENSE)。本地组件与受管理组件保留各自许可证，详见[来源说明](../../docs/SOURCES.md)。

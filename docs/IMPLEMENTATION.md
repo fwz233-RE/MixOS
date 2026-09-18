@@ -1,9 +1,41 @@
-# Implementation ownership and interfaces
+# 系统结构与接口
 
-All work is inside D:/TheEndDEvice/MixOS. Original repositories untouched.
+MixOS 由 Linux 主机服务、ESP32-S3 外设固件和 STM32 键盘固件组成，模块按处理器和执行任务划分职责。
 
-Parent owns ESP main orchestration, device safety/sampling, portable USB codec, ESP link, portable terminal and integration; shared model below. UI owner owns firmware/esp32s3/main/mix_ui.[ch], tools/preview/* and tests for preview only. Keyboard owner owns firmware/keyboard/* and firmware/esp32s3/main/mix_input.[ch], mix_keyboard.[ch], protocol/KEYBOARD_V1.md, keyboard tests. Linux owner owns linux/*, Python USB codec and its tests, tools/update_esp.py, docs/linux*.md. Do not edit other files.
+## Linux 主机
 
-UI API: mix_ui_init(panel), mix_ui_tick(const mix_view_t *view, uint32_t now_ms), mix_ui_touch(int x,int y,bool down), mix_ui_key(const uint8_t *bytes,size_t len), mix_ui_home_toggle(), mix_ui_notice(const char *ascii), bool mix_ui_take_action(mix_action_t *out), bool mix_ui_terminal_visible(). UI uses mix_terminal.h functions to read terminal cells. UI queues user actions; parent owns hardware/link operations. All UI/terminal calls run in app main task, never CDC/ISR. Parent provides mix_view.h/mix_terminal.h. Page changes do not disconnect live terminal; incoming text updates offscreen terminal. Fixed terminal 80x28, fixed fonts first version, no unsupported font-size control. Four themes and Chinese/English saved under mixui NVS namespace. UI init does not probe sensors or write I2C. Own UI framebuffer exactly 1.5MiB; don't create full-screen temporary buffers. Need no vsync dependency or ui.c compilation.
+`linux/mixosd.py` 负责普通用户终端会话、主机指标、应用入口与 USB 链路。`linux/protocol.py` 定义帧编码；`linux/serial_transport.py` 负责串口访问。
 
-Keyboard portable input API: enum mix_key_action {MIX_KEY_TEXT=0,MIX_KEY_HOME=1,MIX_KEY_BRIGHT_UP=2,MIX_KEY_BRIGHT_DOWN=3,MIX_KEY_VOLUME_UP=4,MIX_KEY_VOLUME_DOWN=5,MIX_KEY_BACKLIGHT=6}; typedef void (*mix_key_cb)(int action,const uint8_t *bytes,size_t len,void *ctx); void mix_input_init(mix_key_cb cb,void*ctx); void mix_input_event(uint8_t row,uint8_t col,bool down,uint32_t now_ms); void mix_input_tick(uint32_t now_ms); void mix_input_reset(void). Clear and require full release on resync. ESP driver API: esp_err_t mix_keyboard_init(i2c_master_bus_handle_t bus,mix_key_cb cb,void *ctx); void mix_keyboard_tick(uint32_t now_ms); void mix_keyboard_reset_input(void); bool mix_keyboard_online(void); uint32_t mix_keyboard_overflows(void); void mix_keyboard_backlight_step(void); call from main every20ms. Driver can call mix_input APIs. Cap I2C work per tick and throttle offline. All files new except owned keyboard clone. Explicitly track QMK pin/version/coverage verification outstanding if cannot build. No USB fallback on disconnect.
+终端数据和维护操作使用不同通道。更新进程在维护锁下协调服务，不能与正常守护进程同时占用设备。应用与后端集成见 [AI 与应用](AI_DECK.md)。
+
+## ESP32-S3
+
+- `main.c` 组织初始化、主循环、本地输入、健康状态和动作分发。
+- `mix_view.h` 定义界面读取的设备状态与动作模型。
+- `mix_ui.c` 绘制界面、处理本地交互并排队动作，不直接承担 Flash 更新。
+- `mix_terminal.c` 解析终端输出；普通远程文本不能授权本地维护操作。
+- `mix_link.c` 承担链路、会话、收发队列和协议路由。
+- `mix_ota.c` 与 `mix_ota_tx.c` 在专用工作任务中管理应用更新。
+- `mix_health.c` 跟踪必要本地任务进度，`mix_restart.c` 管理普通更新的重启步骤。
+
+UI、终端模型和本地输入在应用主任务中使用，避免从 USB 回调或中断并发操作显示模型。硬件访问遵守共享 I²C、显示／音频引脚与 Flash 缓存约束。
+
+## 界面接口
+
+主要接口位于 `mix_ui.h`：初始化、周期刷新、触控、按键、通知和动作领取。界面返回有界的动作请求，由主循环检查状态并执行。
+
+处理本地按键时，需要先确定终端可见性和模态状态，避免同一确认键既关闭本地对话框又发给 Linux shell。进入应用页面会请求打开相应会话，离开已打开会话的应用页面会请求关闭它；Agent 占位页不建立会话。
+
+具体渲染和预览说明见 [界面实现](ui-implementation.md)。
+
+## 键盘接口
+
+STM32 扫描物理矩阵并输出带序列和 CRC 的事件；ESP32 驱动通过共享 I²C 总线拉取、确认和恢复同步。
+
+`mix_input.c` 是可移植按键解释层，`mix_keyboard.c` 是 ESP-IDF 总线集成层。回调提供长度明确的文本或本地动作，文本可能含 NUL，不能当作普通 C 字符串。
+
+断连、溢出或同步错误后需要完整释放边界才恢复输入，避免旧修饰键、重复键或历史事件重放。见 [键盘实现](keyboard.md)和 [协议](../protocol/KEYBOARD_V1.md)。
+
+## 实现与硬件的区别
+
+主机测试可验证编解码、状态机、边界及失败处理；实际屏幕、音频、按键电气行为、复位和断电恢复需要独立硬件验证。完整的来源检查、协议一致性和备份要求见 [构建](BUILD.md)、[测试](TESTING.md)与[部署](DEPLOYMENT.md)。

@@ -1,207 +1,139 @@
-# Audio hardware notes
+# 音频硬件与配置说明
 
-Three places in the firmware point here for the reasoning behind a constant
-that looks arbitrary:
+本文说明当前板级配置中的 ES8389 音频路径、共享引脚约束和软件处理方式。
+引脚与默认参数以 [board_pins.h](../firmware/esp32s3/main/board_pins.h) 为准，
+初始化与恢复以 [audio.c](../firmware/esp32s3/main/audio.c) 为准。
+这些配置面向仓库所适配的板型，移植到其他版本时应重新核对原理图和布线。
 
-- `firmware/esp32s3/main/audio.c` for `no_dac_ref` and for the DAC channel swap
-- `firmware/esp32s3/main/board_pins.h` for `BOARD1_ADC2_DEAD_WORKAROUND`
+## 信号路径
 
-Each of those is a workaround for something measured on real boards. Written
-down here rather than in the source, because the evidence is longer than the
-code it justifies, and because several of the findings only make sense next to
-each other.
+- 录音：两路 ZTS6056 模拟麦克风 → ES8389 模数转换器（ADC）→ I2S → ESP32-S3 → USB 音频 → Linux。
+- 播放：Linux → USB 音频 → ESP32-S3 → I2S → ES8389 数模转换器（DAC）→ 扬声器或耳机链路。
+- MIC3 对应 ES8389 MIC1 输入和左 ADC，MIC4 对应 MIC2 输入和右 ADC，板级定义为伪差分输入。
+- `AUDIO_3V3` 由 AW9523 扩展器的 `P1_0`（`DAC_3V3_EN`）控制，启动流程先使能该电源。
+- 扬声器功放使能与耳机检测由 [main.c](../firmware/esp32s3/main/main.c) 协调。
 
-## The signal path
+I2S 使用同一端口全双工，收发共享时钟，当前配置为 48 kHz、16 位、双声道。
+ESP32-S3 为 I2S 主设备，ES8389 为从设备；板上未接 MCLK，配置 `use_mclk=false`，由 BCLK 派生内部时钟。
+固件以单个 `ESP_CODEC_DEV_TYPE_IN_OUT` 设备句柄承担录音和播放。
+调整采样格式时，需要同时考虑 I2S、编解码器与 USB 音频描述符，不能只改 Linux 录音参数。
 
-```
-MIC3 (left)  ─ ZTS6056 ─→ ES8389 MIC1 (pin 24/23, pseudo-differential) ─→ ADC left
-MIC4 (right) ─ ZTS6056 ─→ ES8389 MIC2 (pin 22/21, pseudo-differential) ─→ ADC right
-                                        │
-                                   I2S DIN = GPIO48
-                                        ↓
-                              ESP32-S3 ─ USB UAC ─→ CM5 ─→ arecord
-```
+## LCD 与 I2S 共用 GPIO47/48
 
-Playback runs the other way through `I2S DOUT = GPIO47`. Both directions share
-one I2S port in full duplex, so they share the clock: 48 kHz, 16-bit, stereo.
-`AUDIO_3V3` is switched by AW9523 `P1_0` (`DAC_3V3_EN`), which `main.c` drives
-high at start-up; nothing else in the microphone path needs an IO operation.
+当前硬件通过 R50/R51 零欧电阻将音频数据线与 LCD 初始化串行总线连接：
 
-The recogniser wants 16 kHz mono, so `linux/apps/audio.py` asks ALSA for that
-and ALSA resamples. What it does *not* do is pick a microphone — see below.
+- GPIO47：LCD 的 SPI 时钟，同时是 I2S `DOUT`，向 ES8389 发送播放数据。
+- GPIO48：LCD 的 SPI `MOSI`，同时是 I2S `DIN`，接收 ES8389 的录音数据。
+- GPIO45 / GPIO46：分别为 I2S `BCLK` / `LRCK`。
 
-## GPIO47 and GPIO48 are shared with the LCD
+面板仅在初始化阶段使用这条 SPI 总线，正常画面由 RGB 并行接口持续传输。
+因此启动顺序是硬件约束，而非可随意交换的初始化习惯：
 
-`R50`/`R51` (0 Ω) tie the I2S data pins to `ESP_LCD_SCLK`/`ESP_LCD_MOSI`. The
-JD9168S panel needs a one-time SPI initialisation sequence at boot, so the
-ordering is fixed and `main.c` guarantees it:
+1. 完成面板复位，执行 `lcd_jd9168s_spi_init()`。
+2. [LCD 初始化实现](../firmware/esp32s3/main/lcd_spi_init.c) 移除 SPI 设备并释放 SPI2 总线。
+3. 再调用 `audio_start()`，将 GPIO47/48 配置为 I2S 数据引脚。
 
-1. `lcd_jd9168s_spi_init()` drives GPIO47/48 as SPI2 and sends the panel's
-   init sequence, then calls `spi_bus_free(SPI2_HOST)`.
-2. `audio_start()` reconfigures the same pins as I2S DOUT/DIN.
+音频运行期间不能再次直接执行面板 SPI 初始化，否则会争用音频引脚。
+若增加面板重新初始化功能，应先设计音频停止、引脚交接与恢复流程。
+USB 音频恢复本身只重建编解码器和 I2S，不需要重新初始化面板。
 
-After step 1 the panel runs on the RGB parallel interface (GPIO 1–4, 8–18,
-38–42) and never touches 47/48 again, so the two uses do not overlap in time.
+## 编解码器寻址与输入模式
 
-One side effect of step 1 matters for diagnosis: `spi_bus_free()` resets the
-pins through `gpio_reset_pin()`, which **enables their pull-ups**. GPIO48
-therefore idles high. That is why a codec which has stopped driving the line
-reads as `0xFFFF` — `-1` as a signed sample — rather than as zeros.
+`audio_start()` 按 `ES8389_I2C_ADDR_CANDIDATES` 探测 `0x10` 至 `0x13` 的 7 位 I2C 地址。
+当前板级注释记录地址选择脚未固定，因此实现不能假设只有一个地址。
+传给 `esp_codec_dev` 控制接口的地址按其接口约定左移一位，避免混淆 7 位地址和总线地址字节。
 
-## The ES8389's I2C address has to be probed
+全部候选地址无应答时，应先检查音频电源，再排查 I2C 连接、地址配置和器件状态。
+无应答本身不足以证明一定是电源故障；I2C 有应答也不足以证明录音数据正常。
 
-`AD1` is left floating, so the 7-bit address settles anywhere in `0x10`–`0x13`.
-`audio_start()` probes the candidates in order and uses the first that answers.
-A board where none answer has no `DAC_3V3`; that is a power fault, not an
-address problem, and the log says so.
+`no_dac_ref=true` 用于保留两路麦克风输出。
+在所用驱动中关闭此选项会启用 DAC 回采参考模式，使右侧输出时隙承载播放参考，而非 MIC2 输入。
+它是输入路由选择，不表示应用已经具备声学回声消除功能。
 
-The old `ES8389_I2C_ADDR 0x20` constant contradicted every measurement and was
-never referenced by anything. It is gone.
+## 输入增益与语音声道
 
-## `no_dac_ref` must be true
+固件当前请求 36 dB 的麦克风可编程增益（PGA），驱动映射到 ES8389 的 36.5 dB 档。
+这是 ADC 前的模拟增益，与 Linux 侧的软件幅度调整作用不同。
+过高增益可能使近距离或大音量输入削波；默认值不是适用于所有麦克风、外壳和声学环境的校准结果。
 
-With `no_dac_ref = false` the driver enables the codec's AEC reference mode, in
-which the ADC's right slot is replaced by a loopback of the DAC output. MIC2's
-signal then never reaches I2S at all. Recording appears to work — there is data
-on the line — and the right channel is an echo of whatever is playing.
+[Linux 音频模块](../linux/apps/audio.py) 用 `arecord` 采集双声道，再保留其中一路：
 
-## The two microphones are not equally useful
+- `MIXOS_AUDIO_DEVICE` 默认 `plughw:CARD=UACCDC,DEV=0`。
+- 使用声卡名称，避免 HDMI 等设备改变声卡编号；`plughw` 允许 ALSA 转换采样率。
+- 识别输入使用 16 kHz 单声道，`MIXOS_VOICE_CHANNEL=0` 选择左路，`1` 选择右路，默认 `0`。
+- 直接向 ALSA 请求单声道可能发生混音，并不等于选择指定麦克风。
+- 电平条使用所选声道的数据，录音最长 120 秒，停止后进行识别前处理。
 
-The card offers capture only as stereo, so asking ALSA for one channel averages
-both rather than selecting one. Measured on typixdeck on 2026-09-14, three
-takes of room noise and three of the same sentence through the deck's own
-speaker, with the PGA at 24.5 dB:
+选择单路是为了避免另一路噪声或质量差异影响语音输入，不代表所有板子的右麦克风都不可用。
+应在目标板上分别比较两路的语音清晰度、底噪与削波情况，而不是只选择电平更高的一路。
+当前语音应用没有双麦阵列处理或自动声道择优。
 
-| channel | noise rms | signal rms | signal-to-noise |
-| --- | --- | --- | --- |
-| FL | 0.00200 | 0.00518 | +8.2 dB |
-| FR | 0.00511 | 0.00464 | −0.8 dB |
+## 识别前处理与阈值
 
-The right-hand microphone hears its own noise about as loudly as it hears a
-voice. Averaging the two drags a usable +8 dB channel down to roughly −1 dB,
-and the transcripts show it — the same takes, each channel through the same
-level correction:
+`for_recognition()` 将有符号 16 位 PCM 转为小端 float32，并按录音电平进行有上限的增益调整。
+当前目标均方根电平（RMS）为 `0.08`，放大时的峰值目标上限为 `0.95`，最大软件增益为 `32`。
+处理不会主动降低已足够响的录音，也不能修复采集阶段已经发生的削波。
+软件放大会同时放大噪声，不能替代硬件排障或改善原始录音的信噪比。
 
-```
-FL        今天天气很好，我们一起去公园      (and two near misses)
-FR        fragments and invented syllables
-averaged  nothing at all
-```
+应用分别检查两类情况：
 
-So `linux/apps/audio.py` selects one channel and discards the other. This is
-worth about 9 dB over what ALSA's average produced, and it costs nothing.
-`MIXOS_VOICE_CHANNEL` exists because a quiet right channel may be particular to
-this unit, so a differently behaved board is a deployment setting rather than a
-code change.
+- 采样最大值与最小值之差不超过 `2` 个计数：视为没有有效麦克风信号，跳过识别。
+- 归一化峰值不超过 `0.05`：视为过轻的输入，不通过软件放大把噪声当成语音。
 
-**The louder channel is not the better one.** FR reads higher on a meter
-precisely because its noise floor is higher, which is the trap this table
-exists to document: anyone re-measuring with a level meter and no speech will
-conclude FR is the stronger microphone and be wrong.
+电平条还使用 `NOISE_RMS=0.008` 作为显示起点。
+以上值是当前实现的启发式参数，不是通用硬件判据；更换输入通道或模拟增益后需重新评估。
+识别返回空文本可能与音量、语言选择或模型有关，不能单凭 HTTP 成功状态认定音频路径正常。
 
-## Board #1 has a dead right-hand analogue front end
+## 特定故障的兼容开关
 
-Board #1 (ESP MAC `70:04:1D:D7:E3:40`) produces nothing at all on ADC2 — a
-separate and more severe fault than the noise figures above.
-`BOARD1_ADC2_DEAD_WORKAROUND` sets REG0x23 bit4, which makes the right channel
-a digital copy of the left, so a stereo capture at least carries the signal in
-both slots.
+`BOARD1_ADC2_DEAD_WORKAROUND` 是保留的历史名称，当前默认值为 `0`。
+启用后通过 `adc2_copy_left` 设置寄存器 `0x23` 的 bit4，使右声道输出左声道的数字副本。
+它仅用于已明确诊断为右路模拟前端异常、且接受丢失独立右声道的设备。
 
-Board #2 (`70:04:1D:D8:52:70`) and any healthy board must leave it at `0`, or
-true stereo is thrown away. **The constant is currently `0`.** Check the MAC
-before changing it.
+这个选项不会修复右侧模拟输入，也不应作为正常板的默认配置。
+若两路信号相同，应先确认该开关和输入路由，再判断硬件状态。
+Linux 的 `MIXOS_VOICE_CHANNEL` 只选择应用使用哪路数据，与该固件复制开关不同。
 
-## The speakers are wired left-to-right
+## 扬声器与耳机的声道映射
 
-REG0x44 (`DAC MIX CONTROL`) bit5 routes DAC2→DAC1 and bit4 routes DAC1→DAC2;
-setting both (`0x30`) is a complete digital L/R swap. `audio_set_dac_lr_swap()`
-applies it when playing through the board's own speakers and removes it when
-headphones are inserted, because only the speaker path is reversed.
+当前适配对扬声器路径启用左右互换补偿，插入耳机时恢复正常映射。
+`audio_set_dac_lr_swap()` 读改写寄存器 `0x44`，同时设置或清除 bit5、bit4（掩码 `0x30`）。
+这是当前板级输出布线的补偿，不能推广为 ES8389 或所有板型的固定行为。
+更换板型、扬声器接线或耳机电路时，应重新确认左右映射。
 
-It is a read-modify-write under the codec mutex. It has to be: a concurrent
-volume change used to be able to land between the read and the write, after
-which this function would restore the stale register.
+寄存器读改写与音量、静音、录放音访问共用编解码器互斥锁，避免并发访问产生过期寄存器值。
+外部模块应使用 [audio.h](../firmware/esp32s3/main/audio.h) 的接口，不绕过它直接操作设备句柄。
 
-## Microphone PGA gain: 36 dB, not 24
+## 采集健康检测与恢复边界
 
-The ES8389 goes to 36.5 dB (`ES8389_MIC_GAIN_36_5DB`) and the driver maps a
-request to the nearest step, so anything ≥ 36 lands on the top one.
+`audio_ready()` 仅表示编解码器已找到并打开，不等于麦克风正在输出有效数据。
+播放正常、I2C 应答正常与录音有效是不同检查项。
+恒定的 `-1`、零值或其他近乎不变的样本值得排查，但不能单凭样本值锁定故障器件。
+例如数据线未被驱动而处于上拉状态时可能读到 `0xFFFF`，读失败补零也会产生恒定数据。
 
-This was 24.0 dB for a long time, on the theory that holding the device against
-its own speaker would clip. Re-measured against real speech on 2026-09-14 the
-conclusion reversed: voice peaked at only 0.06–0.08 of full scale, wasting
-about 22 dB of headroom, and Moonshine answers audio that is too quiet with an
-empty transcript and HTTP 200 rather than an error. On screen an empty
-transcript is indistinguishable from broken speech recognition, which is
-exactly how it was reported.
+当前恢复机制如下：
 
-At 36.5 dB peaks land near 0.25–0.33, still far from clipping, and the
-signal-to-noise improves by 12 dB. This is analogue gain ahead of the ADC, so
-it improves what the software normalisation in `for_recognition()` cannot.
+1. USB 录音回调仅在 `audio_read()` 成功时调用 `audio_note_capture()`。
+2. 数据跨度不超过 `2` 个计数的连续观测持续约 2 秒后，`audio_capture_dead()` 报告异常。
+3. 设备任务约每秒调用 `audio_maintain()`；它检查异常或缺失句柄，并将自动重试间隔限制为 30 秒。
+4. `audio_recover()` 先撤下共享句柄，释放编解码器接口和 I2S，再执行正常初始化流程。
+5. `audio_recovery_count()` 只累计成功的重建，不能据此判断故障根因已消除。
 
-## 2026-09-14: the codec stops driving I2S after many hours
+初始化和重建通过状态保护避免同时发生，读写在互斥锁内重新取得句柄。
+重建期间或读取失败时，录音缓冲区会补零；这些失败缓冲区不能再次计入固件的异常采样统计。
+当前没有空闲时主动采样的检测路径，健康判断依赖成功的 USB 录音回调。
+启动故障还受 `main.c` 的维护流程控制，不能把运行期恢复描述为所有启动故障都能自动修复。
 
-**Symptom.** Both interfaces reported `没听到声音，离麦克风近一点再说`.
-Speaking louder or standing closer changed nothing.
+## Linux 侧检查
 
-**Measurement.** `tools/probe_deck_mic.py`, four seconds of capture with the
-device up for 19 hours:
+先用 `arecord -l` 和 `aplay -l` 确认录放音设备，再核对应用的声卡设置。
+以下为目标 Linux 设备上的双声道采集示例，会在当前目录写入录音；声卡名称须按设备实际配置替换：
 
-```
-FL  peak 0.0000  rms 0.00003  span 0 counts  min -1  max -1
-FR  peak 0.0000  rms 0.00003  span 0 counts  min -1  max -1
+```sh
+arecord -D plughw:CARD=UACCDC,DEV=0 -f S16_LE -r 48000 -c 2 -d 5 capture.wav
+aplay -D plughw:CARD=UACCDC,DEV=0 capture.wav
 ```
 
-Every one of 128000 samples was exactly `-1`, on both channels. A live capture
-carries the room even in silence — a quiet room spans some hundreds of counts —
-so a span of zero is not a quiet room. It is GPIO48's pull-up holding a line
-that nothing is driving.
-
-**What it was not.** Playback still worked, the codec still answered on I2C,
-and `audio_read()` returned success — it zero-fills on failure, and these were
-not zeros, so I2S was reading fine. The fault was downstream of the ESP32 and
-upstream of the pin: the ES8389 had stopped driving its ADC data output.
-
-**Why nothing noticed.** `audio_ready()` answers "is there an open handle".
-The handle stayed open the whole time, so the screen went on reporting the
-audio path as ready, and the microphone was dead until the next reboot.
-
-**Fix.** Reflashing — and therefore restarting the ESP32 — restored it
-immediately:
-
-```
-FL  peak 0.0311  rms 0.00822  span 1994 counts
-FR  peak 0.1124  rms 0.02488  span 6957 counts
-```
-
-Those levels also confirm the 36.5 dB gain took effect: FL's noise floor of
-0.0075–0.0082 is very close to 4× the 0.00200 measured at 24.5 dB, which is the
-+12 dB the gain change was worth. The 2.8:1 ratio between FR and FL noise
-matches the 2.6:1 in the table above, i.e. the two microphones still differ the
-way they always did.
-
-**Why it needed a code change.** A fault that takes nineteen hours to appear
-and a reboot to clear will happen again, and the device could not see it. So
-`audio.c` now watches for it:
-
-- `audio_note_capture()` tests every buffer the USB host records against the
-  same two-count dead-line threshold `linux/apps/audio.py` uses, so the device
-  and the interfaces cannot disagree about what a dead microphone is.
-- `audio_poll_capture()` takes a short capture of its own once a second **when
-  nothing is recording**, so a codec that dies while the device sits idle is
-  found before someone tries to use it, rather than by the recording that the
-  fault would ruin.
-- Two unbroken seconds of dead line triggers `audio_recover()`, which
-  unpublishes the handle, closes the codec, tears down I2S and repeats the
-  start-up sequence exactly. `audio_recovery_count()` reports how often that
-  happened, because a codec rebuilt repeatedly is a different fault from one
-  rebuilt never, and a working repair hides the difference.
-
-Recovering rather than rebooting keeps the terminal, the keyboard and the
-screen alive, none of which were affected by the fault.
-
-**Watch out for.** `audio_recover()` runs on the device task while the USB task
-may be mid-capture, so the handle is cleared under the mutex and closed only
-after that critical section ends. `audio_read()` and `audio_write()` re-read
-the handle *inside* the lock for the same reason; they used to check it outside
-and pass it in, which was safe only while nothing ever closed the codec.
+检查两路数据的变化范围、语音与背景噪声，并用适当音量确认输出路由。
+录放音测试通过之后，再检查识别语言、模型资产和后端服务，避免把所有失败归因于麦克风。
+应用和后端配置见 [AI_DECK.md](AI_DECK.md)；本文不包含特定设备的验收结论。

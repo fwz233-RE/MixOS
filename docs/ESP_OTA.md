@@ -1,83 +1,81 @@
-# ESP32-S3 USB 应用更新
+# ESP32-S3 日常 A/B 更新
 
-## 最新实机结果：十次连续更新通过，日常入口已发布
+A/B 是 ESP32-S3 的两个应用分区。Linux 负责发起、传输和核验，固件负责写入、启动选择与试运行确认。日常更新使用应用 USB CDC 通道，不进入 ROM 下载模式，也不要求按 BOOT、RESET 或在屏幕上确认。
 
-2026-09-18，新的 `normal-alternation-readverify-20260918` 已独立完成十次连续免按键 A/B 更新，每轮完整文件／ELF／长度、槽位、新启动、VALID、维护确认、持续心跳及服务恢复均通过。原始通信 1779 次测量中有两次未收到回复，各由一次满足严格条件的新 ID 只读重测恢复；没有借用旧结果或把之前中断序列的恢复计入连续成功。所有证据已下载并独立核验，详见 [DEPLOYMENT.md](DEPLOYMENT.md)。
+## 使用前提
 
-CM5 已安装 `/usr/local/bin/mixos-esp-update`。日常在 Linux 上以普通用户运行：`mixos-esp-update inspect --package /path/to/release` 检查包；`mixos-esp-update apply --package /path/to/release --timeout 60 --health-timeout 180 --wait` 明确授权并提交实际更新；`mixos-esp-update status --job <任务ID>` 查询原任务。这些命令不需要 Windows、源码树或持续 SSH，不使用 BOOT／RESET 按键。入口绑定已验收的 `/opt/mixos-acceptance/normal-alternation-readverify-20260918/alternate`，须保留该受保护目录。实际更新仍须遵守原事务对账及失败停止规则。
+- 设备已有正确 A/B 布局，并运行支持第二版更新协议和维护健康确认的接收端。
+- 当前运行状态明确且允许更新，候选镜像适配目标芯片、分区和安全配置。
+- Linux 普通用户有精确设备的串口权限，已配置维护锁、受控的 `mixosd.service` 停启权限和 systemd 用户任务。
+- 发布包由[构建工具](BUILD.md)生成，包含 `app.bin`、`manifest.json` 和自包含运行器。
 
-正式入口的最终实时检查确认 `ota_0 / VALID`、ELF `532717dd…`、启动 ID `647101243` 和服务 active。用户随后明确确认屏幕已显示 `532717dd` 且画面正常；此前 `f19de3d0` 属于旧 B 版本。用户选择保留当前良好状态，先准备备用板或独立复位通道，再单独进行高风险验收。故障注入、受控断电和任意死机的独立 EN／BOOT 恢复仍未验收，也未新增授权。正常更新目标通过，不等于整个计划或底层丢回复原因已全部解决。下文较早状态均保留历史含义。
+当前分区定义见 [`partitions.csv`](../firmware/esp32s3/partitions.csv)。通用移植还需核对源码中固定的 USB 身份与板卡策略；仅更换端口路径不代表适配其他设备。
 
-## 历史实机进展：第六轮已恢复，USB 重启修复待新一轮连续验收
+## 检查发布包
 
-2026-09-17 晚间已连续完成五轮精确 A/B 更新，第六轮在新固件启动后未恢复 USB 通信而停止；经用户单独授权的一次 ESP 子设备 USB 总线复位，恢复查询到原事务的新 B，再用 `apply --resume` 完成完整文件、ELF、`ota_1 / VALID`、维护确认、心跳和服务恢复，未重新传输固件。用户确认失联时实体屏幕正常变化。旧十轮任务保留失败，不能将补救算成连续通过；当前正修复重启前 USB 断开并准备新的两槽安装及十轮连续验收。原 A 已按授权替换，外部原始完整备份仍校验一致。详细事实、限制和独立证据见 [DEPLOYMENT.md](DEPLOYMENT.md) 最新状态；下文较早状态均保留历史含义。
-
-## 历史里程碑：2026-09-17 17:33（UTC+8）
-
-首次修复固件 B 已通过实际确认：`ota_1 / VALID`，完整应用文件 SHA-256 `7beaccdac481b4644526030e0cd9e561b119f940516ee09de739ca55c80c9414`，ELF `155c46f4e3d4e952657c1a8277be516920e8e3871f003de79bb1b7774c73aa49`；维护任务健康确认成功后，9 次心跳覆盖 16.172 秒，`mixosd` 已恢复 active，观察任务及清理退出 0。用户同时确认实体屏幕正常。此次观察没有再次复位或刷写，USB 枚举号始终为 49；此前重新枚举的具体起因仍未证明。
-
-证据已下载并独立核验，见 `build/deploy/ota-acceptance-20260916-1749/observe-existing-local-verification.json`。B 安装的完整 8 MiB 读回已验证 A 和共享区域保持不变。用户已另行允许在这些前提下解除旧 A 保护，进行至少 10 次正常交替更新；交替测试尚未完成，故障镜像和断电注入尚未授权。下文“B 尚未安装”等表述保留当时的历史状态，以本节最新证据为准。
-
-当前实现说明见 [ESP_OTA_V2.md](ESP_OTA_V2.md)，协议见 [OTA_V2.md](../protocol/OTA_V2.md)。A/B 指 ESP32 应用槽，不是 Linux 系统更新。
-
-## 当前设备与软件状态
-
-2026-09-16 早先恢复验收曾确认 `ota_0 / VALID` 和实体显示正常。受保护镜像文件 SHA-256 为 `7875d9a513acb95463b72e785ebd160c70d03f85e965c3a30a93d954bb4cff5f`，ELF SHA-256 为 `cfacb3fe25931e918b8f46d1f840da8d57ba39ef799bd0af4629939b9185761a`。后续受控启动诊断重新确认了同一 A／VALID。在此基础上，2026-09-17 01:01（UTC+8）的 `qualify-reviewed-binary-20260917` 已通过完整无写入资格闭环：A 主动 PREPARE／ENTER_BOOT，核实同一芯片 ROM，两次读取完整 8 MiB，单次官方看门狗复位后返回精确 A／VALID，并恢复 `mixosd`。进入 ROM 前和返回后均只查询一次身份，各在查询前后观察 20 秒心跳。已下载两份全片读回并独立核对，与恢复基线零字节差异；该测试全程没有按键或 Flash 写入。B 候选仍未安装，也没有新的实体 LCD 验收。详见 [DEPLOYMENT.md](DEPLOYMENT.md)；原始基线 `esp32-recovery-baseline.json` 保持不变。
-
-新的事务接收端、Linux 原生工具与首次安装流程已完成本地构建和离线测试；用户随后授权了 SSH 实机验收，目前无写入资格闭环已通过，首次 B 安装和交替更新验收仍待完成。历史 bootloader 配置来源不足，默认历史构建路径仍拒绝；新增显式字节证据路径只允许当前 A 的无写入资格测试，不授权安装 B。旧 bootloader 名义 9 秒预算下的候选启动兼容性仍需单独验证。软件实现和单元测试通过不等于安装、回滚或免按键更新已获实机验证。
-
-2026-09-17 的候选离线复核已完成：精确镜像的格式、B 槽容量、静态映射和首条 CPU0 CORE 初始化顺序未发现冲突。但看门狗接管仍在 Flash／外部 PSRAM 初始化、代码复制、双核等待和内存测试之后；有效配置为 120 MHz Flash／PSRAM，不能用镜像头的 80 MHz 推断整个启动过程。SDK 在接管前的时钟校准阶段还会设置名义 1.6 秒看门狗，再改为名义 30 秒，因此旧 bootloader 的名义 9 秒不是唯一时限，也没有被证明足够。官方参考 ROM 指令核查已完成，实机时序与复位效果仍待测；当前材料尚未定位到哈希匹配的 A 原始 ELF，普通 build 不能替代它，但可以直接分析已绑定 A BIN 的段和启动指令，因此寻找 ELF 不是正常首次 B 验收的统一硬性前提。按原计划，现有硬件先实现正常更新及看门狗可恢复故障；独立于应用与 USB 的 EN＋BOOT 控制或备用板用于高风险故障测试和任意死机恢复保障。首次 B 尝试仍需候选专属审查、明确接受未测启动风险及有限停止／对账条件，不能沿用只读资格授权。下午复查发现试运行确认尚缺维护工作任务往返条件，已重新打开固件安全和离线测试任务；主机侧已改为 PENDING 时先测量，并增加“精确 A 已恢复、B 安装仍失败”的独立结果和服务恢复路径。原 `faafb49…` 候选不包含这次固件修复，须另行隔离构建和验证。详细依据与剩余条件见 [DEPLOYMENT.md](DEPLOYMENT.md)。
-
-9 月 15 日旧更新流程曾收到全部字节 ACK，随后没有 DONE 或 HELLO；恢复读回表明仍选择旧 A 槽。没有当次 panic 回溯，不能认定新 UI 或双帧缓冲是根因。旧接收端在缓存关闭时允许 RGB 中断读取 PSRAM，并使用 panic 永久停机配置。新镜像中的修复不能提前保护旧程序执行的 OTA_END，因此**首次安全接收端安装采用独立 ROM 流程，而非盲目重试旧 OTA**。
-
-## 新版本的日常更新
-
-Linux 本机入口为 `linux/mixos-esp-update`，实现位于 `tools/mixos_esp_update.py`。便携包包含 `app.bin`、`manifest.json` 和标准库运行器；Linux 不需要 Windows、源码树或 SSH。`tools/deploy_ota.py` 只是同一入口的可选 SSH 包装器，不再维护第二套成功判断。
-
-离线操作：
+以下命令只检查本地文件，不打开串口、不停止服务：
 
 ```sh
-python3 tools/esp_release.py --output build/releases/candidate
-python3 tools/mixos_esp_update.py inspect --package build/releases/candidate
-python3 tools/mixos_esp_update.py apply --package build/releases/candidate --dry-run
+python3 tools/mixos_esp_update.py inspect --package /path/to/release
+python3 tools/mixos_esp_update.py apply --package /path/to/release --dry-run
 ```
 
-发布包必须来自完整构建。实际 `apply`、`inspect --live` 会接触设备，须另行授权；Linux 受控停服权限、用户服务和共享锁也须先行配置。接口与安装条件以工具 `--help` 和 `ESP_OTA_V2.md` 为准。
+如果已经安装了 `mixos-esp-update` 入口，也可用它代替 `python3 tools/mixos_esp_update.py`。入口需要指向完整、长期保留的运行器目录，不能只复制一个 Python 文件。
 
-更新过程：
+## 查看设备
 
-1. 检查 app 完整文件 SHA、ELF 身份、大小、ESP32-S3 芯片、布局及有效安全配置。
-2. 持久保存任务，取得维护锁，记录并停止原 Linux 服务，核实停止成功才打开 CDC。
-3. 查询新版能力，建立绑定随机事务 ID、文件 SHA、长度和非运行槽的事务；ACK 只表示已写字节。
-4. 单一固件工作任务完成传输 SHA、IDF 镜像校验、精确 flash 文件读回，以及可对账的启动选择。
-5. 显式请求重启，重新连接同一设备，核实运行槽、实际文件 SHA、ELF、VALID 与持续心跳。
-6. 关闭端口，恢复原服务状态，持久保存最终结果。固件成功但服务恢复失败仍是整体失败。
+```sh
+mixos-esp-update inspect --live --device /dev/serial/by-id/DEVICE_ID
+```
 
-END、QUERY 和 REBOOT 可按同一事务对账；掉线或丢 DONE 不会成为重新上传的依据。超时意味着结果可能未知，不能据此宣布旧镜像正在运行，也不能自动进入 ROM 或分区迁移。
+实时检查会取得维护锁、协调服务并访问设备，属于明确的设备操作。`inspect --package` 与 `inspect --live` 具有不同作用，前者不能证明正在运行哪个版本。
 
-## 安全条件与边界
+## 提交更新
 
-- 只写非运行槽；试运行或运行状态未知时禁止下一次更新。
-- 新候选连续健康后，必须标记成功并复读 VALID 才算确认。主机缺席不伪造成功，也不单独触发本地故障回滚。
-- panic、启动和任务看门狗用于触发后续启动，使 bootloader 有机会回滚；它们不保证任意失效都能恢复。
-- 当前 A 槽基线默认锁定。只有 B 槽成为明确包绑定、实际验证的 VALID 回退镜像后，才允许显式解除 A 保护。
-- 外部完整备份必须继续保留；两个槽不能永久保存旧 A 同时无限交替升级。
-- USB 重枚举、Hub reset 或 Linux reboot 不等于 ESP EN 复位。任意固件完全停机的免按键恢复，需要独立复位／下载控制硬件。
+```sh
+mixos-esp-update apply --package /path/to/release --device /dev/serial/by-id/DEVICE_ID --timeout 60 --health-timeout 180 --wait
+```
 
-## 身份与诊断
+`apply` 是实际写入授权。它创建持久任务并交给 systemd 执行；`--wait` 只等待结果，SSH 会话不是更新进程的生命周期。保存输出中的任务 ID。
 
-旧 `OTA_IDENTIFY=75` / `OTA_IDENTITY=76` 的 136 字节结构继续兼容：运行槽、实际镜像状态、复位原因、地址、ELF SHA、编译日期／时间、版本和项目名。ELF SHA 与精确 app 文件 SHA 是不同指标；新版同时验证两者。
+```sh
+mixos-esp-update status --job JOB_ID
+mixos-esp-update status --job JOB_ID --wait
+```
 
-复位原因按 ESP-IDF 5.4 枚举解释：4 为 panic，5 为中断看门狗，6 为任务看门狗，12 为 JTAG reset。历史工具曾错误解释这些数值；旧字符串不应作为可靠诊断。
+排队或执行中不代表成功，等待超时也不等于设备已经失败或回退。
 
-`OTA_BEGIN` 沉默不证明布局为 factory-only。能力未知、设备失联和老版本均可能没有回复。先核实身份与当前任务，不能把通信失败变成破坏性迁移许可。
+## 成功判定
 
-## 历史 A/B 迁移（已完成，不是当前操作步骤）
+一次更新只有同时满足以下条件才返回整体成功：
 
-设备在 2026-09-13 已迁移，不需要再次迁移。历史任务 `mixos-display-20260913-110839` 写入 bootloader、A/B 表与当时 app，并完成整片读回。分区为 A `0x10000/0x1f0000`、otadata `0x200000/0x2000`、font `0x210000/0x400000`、B `0x610000/0x1f0000`；NVS 与 phy 保持原位。
+1. 运行文件的完整 SHA-256、ELF 摘要和精确长度匹配发布包。
+2. 运行槽、启动槽和新启动身份符合本次事务。
+3. 固件完成维护健康确认，实际镜像状态为 VALID。
+4. 在同一启动与会话上观察到连续、新鲜的协议心跳。
+5. Linux 服务恢复到原先应有状态，最终结果已持久保存。
 
-历史迁移的四次写前拒绝原因包括：审批包遗漏 `_mixlib`、已部署镜像常量过时、复用未知 stub、按钮 ROM 下写入粒度不适合小分区。这些拒绝保住了保护区域，但进入 ROM 后仍可能需要独立启动恢复；“写前拒绝”不等于设备必然已恢复运行。
+100% 数据 ACK、USB 枚举、旧查询记录或服务 active 均不能单独替代这些条件。
 
-软件 ENTER_BOOT 的 USB-OTG ROM 标识为 `303a:0009`，已验证 stub 写入块为 `0x800`；按钮进入的 USB-Serial/JTAG 标识为 `303a:1001`，默认块为 `0x4000`。首次安装只接受可安全写单个 4 KiB otadata 扇区的已验证粒度，绝不通过向相邻区域填充来兼容较大块。
+## 超时与对账
 
-首次安全安装分为独立的无写入资格测试、只写 B 的安装、核实结果后的 boot-only 任务。当前恢复任务 `mixos-display-20260916-024325` 保持历史原状，不能重跑。详细授权、完整备份、允许变化区域及官方 watchdog reset 退出条件见 `ESP_OTA_V2.md`。
+先查询已有任务。对已经提交、但主机未观察到最终结果的事务，可以明确请求同一任务对账：
+
+```sh
+mixos-esp-update apply --resume JOB_ID
+mixos-esp-update status --job JOB_ID --wait
+```
+
+`--resume` 不从中断的接收阶段重新上传镜像。仍在接收、身份不符或状态不明时，工具会拒绝不安全的继续操作，不能反复创建新任务来绕过。
+
+运行身份测量只在请求已完整发送、会话不变、有新鲜心跳且无新增解码错误等条件下，最多增加两次只读请求。每次使用新请求 ID，并保持原绝对截止时间；最终仍需新匹配的完整身份回复。它不会因测量超时重刷或重新复位。事务提交阶段原有的幂等 END／REBOOT 对账与此机制分开，见 [实现说明](ESP_OTA_V2.md)。
+
+## 基线保护与恢复边界
+
+- 普通更新只写非运行槽，未知或待确认状态禁止开始下一次更新。
+- 受保护 A 槽的替换需要明确授权、已知 B 包及实际 B 健康证据；不能仅凭设备自报摘要解除保护。
+- 两个槽无法同时永久保留固定旧版本并无限交替，外部完整备份仍应保留。
+- 试运行候选可在复位后由 bootloader 回退；已经 VALID 的应用后来卡死，不保证自动切到另一槽。
+- A/B 不替代硬件复位。USB Hub 重置、Linux 重启不等于 ESP32 EN 复位或断电。
+
+首次安装、单槽迁移和 ROM 恢复需要单独授权，不能由日常更新失败自动触发。详见 [部署指南](DEPLOYMENT.md)和 [恢复说明](ESP32_RECOVERY_FLASH.md)。

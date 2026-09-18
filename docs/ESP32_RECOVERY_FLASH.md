@@ -1,96 +1,51 @@
-# ESP32-S3 recovery flashing procedure
+# ESP32-S3 恢复说明
 
-This is the verified procedure for the TypixDeck ESP32-S3 when the device can be reached through the CM5 but the normal running-application updater cannot be used. It is an operator-authorized recovery procedure, not an unattended update mechanism.
+本页用于应用无法正常维护时的恢复准备，不是日常更新步骤。支持应用 A/B 更新的设备优先使用 [日常更新工具](ESP_OTA.md)；恢复操作需要单独核实设备、写入范围与备份。
 
-## Preconditions
+## 进入恢复前
 
-- CM5 is `typixdeck` at `192.168.1.22`.
-- ESP32 is connected through the internal USB Host route, physical USB location `5-1.2`.
-- The new application has already been built and locally checked.
-- The operator has confirmed that stopping `mixosd` is acceptable.
-- The device can be placed in ROM download mode with the ESP32 side `BOOT` and `RESET/S3_EN` buttons.
+- 确定当前任务是否仍在运行，以及是否已经传输、提交或重启。先保留结果，避免与已有任务并发。
+- 检查服务、USB 路由和物理连接，区分应用无回复、应用 USB 身份和 ROM USB 身份。
+- 核对芯片、Flash 容量、真实分区表、启动配置和安全标志。
+- 准备来源明确的镜像、原始构建报告、完整备份与可用的硬件恢复方式。
+- 保持内部 USB Host 路由和稳定电源。切换 Gadget 或重置 Hub 不是 MCU 复位。
 
-Never switch to External USB Gadget routing during this procedure. It disconnects the internal ESP32 and keyboard.
+## ROM 进入与身份
 
-## 1. Build and validate the application
+应用仍能响应时，可以通过单独授权的维护握手进入 ROM。应用完全无响应时，通常需要板卡对应的 BOOT／EN 操作，或独立控制这些引脚的恢复通道。
 
-From Windows PowerShell:
+ESP32-S3 的 USB-Serial/JTAG ROM 与 USB-OTG ROM 是不同路径，其 USB 标识、下载状态及工具写入粒度可能不同。仅看到一个 `ttyACM` 或厂商 ID 不足以确认目标，应结合物理位置、序列号和 ROM 芯片信息。
 
-```powershell
-wsl.exe bash -lc 'cd /mnt/d/TheEndDEvice/MixOS/firmware/esp32s3 && /mnt/d/TheEndDEvice/MixOS/.tools/idf-tools/python_env/idf5.4_py3.10_env/bin/python /mnt/d/TheEndDEvice/MixOS/.tools/esp-idf-clean/tools/idf.py build'
-```
+GPIO0 的复位采样、软件强制下载状态和 ROM 退出方式都需要核实。普通 RTS 复位不保证从所有下载模式返回应用；无法建立身份连续性时应停止，而不是尝试其他端口。
 
-The application file is `firmware/esp32s3/build/mixos_esp32s3.bin`. The partition table and bootloader are generated under the same `build` directory. Confirm the image hash before uploading it.
+## 写入前的保护
 
-## 2. Enter ROM download mode
+1. 使用已审阅版本的工具和独立环境，不为恢复随意修改系统 Python 或解除芯片保护。
+2. 协调维护锁和服务所有权，确认没有其他程序使用端口。
+3. 读取并持久保存完整 Flash，检查精确长度、摘要和目标身份。
+4. 将写入范围与真实分区表对照，明确哪些区域必须保持不变。
+5. 核实工具实际擦除／写入粒度，特别是 otadata 的冗余小扇区。
 
-1. Hold the ESP32 `BOOT` button.
-2. Briefly press `RESET/S3_EN`.
-3. Release `BOOT`.
-4. Keep the CM5 powered and keep the internal Host route selected.
+普通应用恢复不自动授权重写 bootloader、分区表、字体或 NVS。整片擦除、扩大填充到相邻分区、盲目使用历史偏移都可能破坏恢复条件。
 
-Verify from Windows through the approved remote inspection tool:
+## 首次安全安装与通用恢复
 
-```powershell
-$env:MIXOS_SSH_PASSWORD='your-password'
-python tools/flash_esp_remote.py --native --host 192.168.1.22 --serial TD0720
-```
+`tools/bootstrap_ota_on_pi.py` 及配套工具用于来源明确、布局匹配的受控首次安装路径，要求对应审批与证据，不是任意设备的通用刷写器。既有迁移、恢复脚本也有各自固定目标和限制，使用前应阅读 `--help` 与源码配置。
 
-The expected ROM identity is `303a:1001`, normally `/dev/ttyACM0`, with ROM serial `70:04:1D:D8:54:14`. The running application identity is different (`303a:80c3`, serial `TD0720`); do not pass the running-app serial when the device is in ROM.
+首次安装通常保留当前已知有效应用，只在非运行槽写候选，完整验证后再更新非活动启动记录。写入、退出 ROM 与运行确认是独立阶段，写入结束不应自动循环重刷或复位。
 
-Button entry selects the USB-Serial/JTAG peripheral, which is why the identity is `303a:1001`. That is correct for this procedure, which writes only whole `0x10000`-aligned images, and it is **wrong for the A/B migration**, whose `0x1000` partition table and `0x2000` otadata writes need the `0x800` block size that esptool uses only on USB-OTG (`303a:0009`). Never try to migrate a device from button-entered download mode; see `ESP_OTA.md`.
+因为芯片状态、布局和工具粒度不同，本页不提供可直接复制的全片写入命令。实际恢复命令应依据本次核实的设备状态生成，并由操作员确认。
 
-An aborted flash leaves the esptool stub running on the chip. The next operation must start from a fresh ROM, so repeat this button sequence after any failed attempt rather than reconnecting to the stub. A new USB device number in the kernel log is the evidence that the chip really re-entered ROM.
+## 写后核验与退出
 
-## 3. Make a complete backup before writing
+- 读取授权区域并核对原始文件的精确字节；需要保护共享区域时，对完整 Flash 读回进行差异比较。
+- 完整读回的摘要在应用变化后通常会变化；应按允许变化范围判断，而不是要求与写前全片摘要相等。
+- 核实退出 ROM 的具体方法，只执行已批准的动作；再次枚举不等于应用已经健康。
+- 返回应用后核对完整身份、槽、镜像状态、心跳及服务恢复。实体屏幕和输入需要另外观察。
+- 服务恢复应遵守所用流程的策略；首次安装／ROM 状态尚不明时，不能仅靠启动服务掩盖固件未知结果。
 
-Use a temporary CM5 directory and the pinned `esptool 5.4.0` package. The CM5 uses Debian's externally managed Python environment, so install the wheel with `--break-system-packages` only for this explicitly staged package. Invoke the installed command from a directory other than `/home/pi/.local/bin`; otherwise the launcher file `esptool.py` can shadow the Python package.
+## 失败处理
 
-Stop `mixosd` immediately before the serial operation. Save a full `0x800000`-byte backup from address `0x0`. Do not proceed if this read fails or the resulting file is not exactly 8 MiB.
+超时、断连或工具非零退出可能发生在部分写入之后。保留备份、读回、命令结果和原任务，先确定最后完成的阶段；换一个目录或重新连接下载 stub 都不能证明再次写入安全。
 
-## 4. Write only the intended image locations
-
-Write the generated files at these addresses:
-
-```text
-0x0000  bootloader.bin
-0x8000  partition-table.bin
-0x10000 mixos_esp32s3.bin
-```
-
-Use `--flash-mode dio --flash-size 8MB --flash-freq 80m`. Require `Hash of data verified.` and exit code zero. Never erase the chip, erase NVS, or use an unverified image.
-
-## 5. Complete readback and restore the service
-
-Enter ROM mode again if the write command's reset left the ESP32 running. Read the entire `0x800000` bytes back. Require exit code zero and compare:
-
-- The application range beginning at `0x10000` with the generated application image.
-- The bootloader and partition-table ranges with the files that were written.
-- Any unchanged protected/NVS regions with the pre-write backup.
-
-The complete-image hash is expected to differ after an application update. The application-segment hash is the important exact match.
-
-Restore the service even when a later verification step fails:
-
-```sh
-sudo systemctl start mixosd
-systemctl is-active mixosd
-```
-
-The final service state must be `active`.
-
-## 6. Runtime validation
-
-After the ESP32 leaves ROM and enumerates as `303a:80c3` / `TD0720`, inspect the startup log and look for:
-
-```text
-STC3117 sample: ... V=3.xxxV ... SOC=xx.xxx%
-```
-
-The first displayed SOC can remain at 100% until the fuel-gauge model receives valid discharge samples. Validate it by disconnecting both external charging power and the battery as appropriate for the hardware test, then observe the value over time. Do not infer calibration quality from one immediate percentage reading.
-
-## 2026-09-12 validation record
-
-This procedure was used successfully on the real device. A complete 8 MiB backup was saved with SHA-256 `81ce4145da5fc672d97fae914f438d46b7672600bf5045e66fb5905198c56f15`. The corrected application was written once; esptool reported `Hash of data verified` and the write returned zero. A complete 8 MiB readback returned zero, and its 859824-byte application segment matched SHA-256 `f2ffff9bb37f1c2caae1d52d9a860204eb3e43bcef8d7e07f0089949fdc7e24d`. `mixosd` was restored to `active`.
-
-The earlier application-oriented launcher rejected ROM `303a:1001` because it expected a running application identity and its maintenance epoch. That launcher remains useful for its supported running-app workflow, but this ROM recovery procedure is the correct documented path when hardware download mode is already active.
+若两个应用都不可用，或复位／USB 通道也失效，A/B 本身无法执行恢复。高风险故障与断电实验应先准备备用板或独立 EN／BOOT 控制，并保留物理按钮与电气安全约束。

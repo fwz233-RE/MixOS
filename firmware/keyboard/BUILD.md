@@ -1,136 +1,62 @@
-# Reproducing the STM32 keyboard build
+# STM32 键盘构建
 
-Run the entire target build, memory audit, pinned-source verification and native
-keyboard tests with one command from PowerShell:
+所有项目命令从仓库根目录执行，建议使用 Linux／WSL。构建不刷写、不打开串口、不连接 SSH，但会复制键盘源码到指定 QMK 工作区，并更新本地构建产物及 `firmware/keyboard/QMK_PIN.json` 的验证字段。
 
-    wsl.exe -d Ubuntu-22.04 -- /home/fwz233/mixos-qmk-venv/bin/python /mnt/d/TheEndDEvice/MixOS/tools/build_keyboard.py
+## 环境
 
-The script never flashes, opens a serial device, or uses SSH. It copies only the
-MixOS keyboard into the separate pinned QMK checkout; `.git`, `tests`, `tools`,
-and `release` are excluded. Originals outside MixOS are not build inputs.
+- QMK 源码固定为 0.28.0，具体 commit 见 [QMK_PIN.json](QMK_PIN.json)。QMK CLI 的版本与固件版本是不同概念。
+- 需要 ARM GCC、binutils、newlib、GNU make、QMK Python 依赖及主机 C 编译器。参考工具链为 ARM GCC 10.3.1、binutils 2.38。
+- 在固定版本 QMK 工作区内初始化所需子模块：
 
-## Toolchain and dependencies
+```sh
+git submodule update --init --depth 1 lib/chibios lib/chibios-contrib lib/printf lib/lufa
+```
 
-The verified environment uses Ubuntu 22.04 under Windows Subsystem for Linux,
-ARM GCC 10.3.1 (20210621), GNU binutils 2.38, newlib, GNU make and the QMK Python
-requirements in `/home/fwz233/mixos-qmk-venv`. The QMK CLI package is 1.2.0;
-the firmware source is **QMK 0.28.0**, not the CLI package version.
+LUFA 为构建提供 USB 描述符类型，不会启用物理按键的 USB HID 输入。构建驱动在编译前核验 QMK 及所需子模块版本。
 
-QMK must be checked out at the commit in `QMK_PIN.json`. Initialize all four
-required pinned submodules:
+## 构建命令
 
-    git submodule update --init --depth 1 lib/chibios lib/chibios-contrib lib/printf lib/lufa
+回到 MixOS 根目录，使用已安装 QMK 依赖的 Python：
 
-LUFA is required even for this ARM/ChibiOS target because QMK includes its USB
-HID descriptor type definitions. This does not enable physical-key USB input.
-The build script verifies the QMK commit and each required submodule revision
-before invoking the real target compiler.
+```sh
+python tools/build_keyboard.py --jobs 4
+```
 
-The underlying commands are:
+默认 QMK 目录为 `.tools/qmk-0.28.0`，可用 `--qmk-root PATH` 指定同一固定版本的其他工作区。`--build-only` 仅用于编译排错，不建立完整验证状态。
 
-    qmk compile --clean -kb keebdeck_6r11c -km default -j 4
-    qmk compile --clean -kb keebdeck_6r11c -km diag -j 4
-    python firmware/keyboard/tools/verify_qmk.py
-    python -m unittest discover -s tests -p 'test_keyboard*.py' -v
+驱动使用 `qmk compile --clean` 分别编译 `default` 和 `diag`。清理构建可避免新增 `mcuconf.h` 等覆盖头文件后仍复用旧依赖对象；不要用来源不一致的增量产物替代发布构建。
 
-Both target builds now use `--clean`. A new include-path override such as
-`mcuconf.h` is not listed in pre-existing compiler dependency files, so an
-incremental build can otherwise retain the old generic-board object code.
-The first rebuild during this investigation reproduced that stale binary;
-it was rejected for deployment. Regression coverage requires clean compilation.
+后续步骤包括 ELF 内存审计、固定上游源码验证和键盘测试。上游验证会下载少量固定 commit 文件；源码验证与目标编译、硬件验证是不同检查。
 
-Use `--qmk-root PATH` for another exact-revision checkout, or `--jobs N` to
-change parallelism. `--build-only` is for compiler debugging and deliberately
-cannot set `target_build_verified=true`.
+## 产物与原始镜像
 
-## Startup clock correction (2026-09-11)
+`build/keyboard` 保存二进制、ELF、链接映射、内存审计、日志、工具版本、来源清单及 SHA-256 摘要。大小与摘要以本次构建结果为准，不复用文档中的历史数值。
 
-The keyboard-local `mcuconf.h` now enables HSI48, the internal 48 MHz
-oscillator already selected for USB by QMK's generic F042 board. The inherited
-system clock remains HSI/2 multiplied by 12 (48 MHz), and I2C1 remains on HSI
-(8 MHz); the custom I2C slave retains exclusive ownership of I2C1. No rescue,
-Bootmagic, EEPROM or ROM bootloader logic is changed. See `STARTUP.md` for the
-compiled-source evidence, boot marker flow and the limits of this correction.
+严格 DFU 工具使用 `keebdeck_6r11c_default.raw.bin` 或 `keebdeck_6r11c_diag.raw.bin`：
 
-The clean target rebuild completed on 2026-09-11: both keymaps, memory audits,
-pinned-source verification and all 16 keyboard tests passed. `QMK_PIN.json`
-now has `target_build_verified=true`; `hardware_verified` remains false.
-The prior complete target directory is preserved on the CM5 at
-`/home/pi/mixos-keyboard-build-before-clock-20260911`. The sizes below describe
-the new clock-corrected build. Actual ARM disassembly contains the HSI48ON
-write and HSI48RDY wait (see `build/deploy/keyboard-20260911-clock-machine-code.md`).
-Raw-only export compares the complete firmware source file set as well as
-hashes, so an added `mcuconf.h` cannot silently reuse a stale verification.
+- 从 ELF 导出原始二进制。
+- 校验 QMK `.bin` 的 DFU 后缀、身份及 CRC。
+- 要求原始镜像与去掉后缀后的 QMK 内容逐字节一致。
+- 调用刷写工具的可移植镜像验证函数，不调用硬件入口。
 
-Run host-only regression tests without replacing any target artifacts:
+对已有且来源仍一致的完整验证构建，可以不重新编译地导出：
 
-    wsl.exe -d Ubuntu-22.04 -u fwz233 -- /home/fwz233/mixos-host-venv/bin/python -B -m unittest discover -s /mnt/d/TheEndDEvice/MixOS/tests -p 'test_keyboard*.py' -v
+```sh
+python tools/build_keyboard.py --export-raw-only
+```
 
-The clock tests preprocess the real pinned F042 configuration and clock driver
-with native `cc`; the unmodified upstream board is a failing negative control.
-They verify HSI48 enable/readiness code, 48 MHz CPU/bus/USB clocks, the unchanged
-8 MHz I2C1 source, and disabled HAL ownership of I2C1. `QMK_HOME` selects another
-local checkout (the build script already supplies it). This is source-level
-coverage, not an oscillator, USB or target-link test.
+该模式仍会核对保存的源码和产物摘要，并运行导出相关测试；不能用于给任意旧镜像补造来源。
 
-## Artifacts and automatic limits
+## 容量与验证边界
 
-`build/keyboard` contains both targets' `.bin`, `.elf`, `.map`, `.build.log`,
-`.sections.txt`, `.symbols.txt`, `.size.txt` and `.memory.json` files. The ELF
-files retain debugging information while runtime code keeps size optimization
-and link-time optimization. Each `.bin` is 15,936 bytes: the 15,920-byte flash
-image plus a 16-byte DFU suffix (not loaded into application flash). The two
-keymaps produce byte-identical binaries. **Use `keebdeck_6r11c_default.raw.bin`
-or `keebdeck_6r11c_diag.raw.bin` for the safe DFU worker**, not QMK's suffixed
-`.bin`. Each raw deployment image is exactly 15,920 bytes. The build script
-creates it directly from the ELF with `arm-none-eabi-objcopy -O binary`, validates
-the QMK suffix's signature, length, identity/version and CRC, then requires
-byte-for-byte equality with the suffix-stripped QMK payload. It calls only the
-portable `tools/flash_keyboard_on_pi.py` function `validate_image`, never its
-hardware entry points. The validator accepts both images and pads each to
-16,384 bytes for programming, remaining below the EEPROM reservation.
+`ld/STM32F042x6.ld` 将应用 Flash 限制为 30 KiB，保留最后 2 KiB 给 EEPROM 仿真；SRAM 为 6 KiB。审计计入加载内容、静态 RAM、两个保留栈及对齐，遗漏栈符号或超限都会失败。
 
-For an already verified build, export without rebuilding or network access:
+只有两个目标编译、内存审计、上游验证及键盘测试均通过后，工具才设置目标构建验证字段。静态容量检查不证明运行期栈峰值、冷启动、USB 时序、实际 I²C 上拉或矩阵行为。
 
-    wsl.exe -d Ubuntu-22.04 -- /home/fwz233/mixos-qmk-venv/bin/python /mnt/d/TheEndDEvice/MixOS/tools/build_keyboard.py --export-raw-only
+仅运行离线键盘测试可使用：
 
-This mode first verifies the stored source and ELF/QMK/map hashes, exports both
-raw images, and runs the focused export/audit regression tests. Each target's
-`.raw.validation.json` records raw and padded hashes, worker validation and
-worker-source identity. The unchanged worker still rejects DFU-suffixed files.
+```sh
+python -m unittest discover -s tests -p 'test_keyboard*.py' -v
+```
 
-`manifest.json` and `SHA256SUMS` record artifact
-hashes; the manifest also records staged firmware source hashes and verification
-script hashes. `toolchain.txt`, `submodules.txt`, `verify_qmk.log`, and `tests.log`
-record the environment and validation. Earlier overwritten logs are retained in
-`build/keyboard/history`.
-
-The keyboard-local linker script limits application flash to **30 KiB**,
-reserving the final **2 KiB** of the STM32F042G6U6's 32 KiB flash for QMK legacy
-EEPROM emulation. It preserves the device's **6 KiB** SRAM limit. The audit
-counts the loaded flash image, `.data`, `.bss`, any other occupied SRAM sections,
-both linker-reserved stacks, and alignment padding. It excludes the unused
-heap region from static usage; it never mistakes that region for occupied RAM.
-Missing stack symbols or any capacity violation fails the build verification.
-
-Only completion of both builds, both memory audits, the pinned-source verifier
-and all keyboard tests permits `QMK_PIN.json` to set `target_build_verified`.
-`hardware_verified` remains false. Host tests use address/undefined-behavior
-sanitizers for the C transport, ESP-side input integration, and stubbed STM32
-interrupt/callback behavior; they are not electrical tests.
-
-## Safety scope and remaining hardware work
-
-The physical-key interception, all-custom keymaps, blank-key mask, 128-entry
-FIFO, ACK/session protocol, backlight handling, exact two-key rescue chord and
-3-second threshold are preserved. USB enumeration and suspend cannot block
-scanning. Pinned QMK retains a fixed 50 ms USB initialization delay; it does not
-wait for a USB host to enumerate the device. No HID consumer/mouse/keyboard key
-input is enabled by the diagnostic build.
-
-Static memory accounting proves that reserved storage fits; it does not prove
-runtime stack high-water marks. USB packet capture, actual I2C interrupt timing
-and pull-ups, matrix ghost behavior, power-up/no-host scanning, bootloader entry
-and board-level pin behavior remain hardware validation tasks. The legacy
-`release/flash_kbd.sh` continues refusing batch flashing, and no firmware has
-been flashed by this build procedure.
+时钟测试需要固定版本的 QMK 源码，`QMK_HOME` 可指定其位置。启动实现见 [STARTUP.md](STARTUP.md)，部署前提见[键盘刷写](../../docs/KEYBOARD_FLASH.md)。

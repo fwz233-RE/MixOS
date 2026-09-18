@@ -1,89 +1,77 @@
-# Local build tools
+# 主机工具与环境
 
-All source changes and generated release artifacts belong to `D:/TheEndDEvice/MixOS`. The original firmware repositories are not build destinations.
+所有命令从仓库根目录执行。示例中的 `/path/to/...`、发行版、用户和设备地址应替换为自己的配置。构建入口见[构建指南](BUILD.md)，检查范围见[测试指南](TESTING.md)。
 
-## Linux host regression environment
+## 主机测试依赖
 
-WSL distribution: `Ubuntu-22.04`; user: `fwz233`. Native `cc`, Clang, CMake, Python 3.10, and make are available. Font builder tests additionally require the pinned packages in `tools/requirements-host.txt`; use an isolated environment rather than modifying system Python:
-
-```sh
-python3 -m venv /home/fwz233/mixos-host-venv
-/home/fwz233/mixos-host-venv/bin/pip install -r /mnt/d/TheEndDEvice/MixOS/tools/requirements-host.txt
-cd /mnt/d/TheEndDEvice/MixOS
-cmake -S tests -B build/host
-cmake --build build/host -j 4
-ctest --test-dir build/host --output-on-failure
-/home/fwz233/mixos-host-venv/bin/python -m unittest discover -s tests -v
-```
-
-Real-device fast ESP32 recovery path (validated 2026-09-12): when the ESP32 is already in ROM download mode and enumerates on the CM5 as `303a:1001` at `/dev/ttyACM0`, the application-oriented deployment launcher may reject it because it expects the running-app identity. The validated fallback is to stop `mixosd`, use the pinned esptool 5.4 package on the CM5, read a complete 8 MiB backup, write bootloader/partition/app at `0x0/0x8000/0x10000`, read the complete 8 MiB again, compare the application segment and restore `mixosd`. This path requires explicit operator approval and must never skip the backup or readback. On 2026-09-12 it wrote the battery-fix app successfully (`Hash of data verified`, `WRITE:0`, `READ:0`); the readback application segment was 859824 bytes and matched SHA-256 `f2ffff9bb37f1c2caae1d52d9a860204eb3e43bcef8d7e07f0089949fdc7e24d`. The complete-image hash is expected to differ from the pre-write backup because the app changed. The fallback should be promoted into a reviewed deployment tool rather than treated as an ad-hoc command.
-
-## Keyboard cross-build
-
-The pinned QMK checkout is `.tools/qmk-0.28.0`, revision `a63fd7f01cdabd9ce85bb09ae2b573fd3b8e60aa`. Required submodules include ChibiOS, ChibiOS-Contrib, printf, and LUFA. The isolated QMK Python environment is `/home/fwz233/mixos-qmk-venv`.
-
-Installed ARM tools: GCC 10.3 (Ubuntu package `15:10.3-2021.07-4`), binutils 2.38, and newlib. Build using `tools/build_keyboard.py`; generated ELF/map/bin files and memory evidence are in `build/keyboard`. The manifest, not tool availability, determines target-build verification.
+建议使用 Python 3.12 和隔离虚拟环境，安装 CMake、make、C 编译器、Clang 与 Node.js。部分测试直接查找 `clang`，并不使用通用编译器设置。
 
 ```sh
-cd /mnt/d/TheEndDEvice/MixOS
-/home/fwz233/mixos-qmk-venv/bin/python tools/build_keyboard.py
+python3.12 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r tools/requirements-host.txt
+python -m pip install pyflakes pytest
 ```
 
-## ESP32-S3 cross-build
+`tools/requirements-host.txt` 固定 fontTools 4.60.1、Pillow 11.2.1。`pyflakes` 用于静态检查，`pytest` 是可选测试入口；该文件没有固定它们的版本，复现时应记录实际环境。Windows 可用 `py -3.12 -m venv .venv` 创建环境，再激活 `.venv\Scripts\Activate.ps1`。
 
-The existing ESP-IDF 5.4.2 checkout used by the build is `.tools/esp-idf-clean`; the isolated tool directory is `.tools/idf-tools`. `tools/idf_env.py` is the single description of that layout: the pinned versions and every derived path live there, and the shell script and the Python drivers all read them from it.
+## Windows 与 WSL
 
-Build from the project root on Windows:
+采用 `tests/_support.py` 的测试和 ESP 构建驱动支持以下覆盖项：
+
+- `MIXOS_WSL_DISTRO`：WSL 发行版；未设置时取 `wsl.exe --list --quiet` 返回的首个名称。
+- `MIXOS_WSL_USER`：发行版内用户；未设置时使用该发行版默认用户。
+- `MIXOS_HOST_CC`：POSIX C 编译器名称或路径，默认 `cc`；不是带参数的整条命令。
+- `MIXOS_PROJECT_ROOT`：这些辅助模块使用的仓库根目录，默认从自身位置推导，建议使用绝对路径。
 
 ```powershell
-py -3.12 tests/esp_font_build.py build
+$env:MIXOS_WSL_DISTRO = "YOUR_DISTRO"
+$env:MIXOS_WSL_USER = "YOUR_LINUX_USER"
+$env:MIXOS_HOST_CC = "cc"
+py -3.12 tools/idf_env.py
 ```
 
-The driver enters the environment through `idf_env.build_command()` and runs the vendored `idf.py build` under WSL, then writes the deployment manifest `build/esp32s3/font-app-build.json`. Do not let a bare `idf.py build` in `firmware/esp32s3` be the last build before a deployment: the binary it produces is correct, but the manifest still describes the previous one, and `tools/deploy_ota.py` will refuse the image. `BUILD.md` has the exact refusals and why `--skip-build-check` is the wrong answer to them.
+盘符路径按 `/mnt/<盘符>/...` 转换；自定义 WSL 挂载布局需单独适配。上述变量不是全仓库统一配置：`run_checks.py` 的 CMake 阶段在当前系统运行，部分测试直接使用本机 Clang，其他工具可能保留自己的目录和设备默认值。
 
-The checkout's `export.sh` is not used. Full activation insists on a RISC-V debugger that is not installed and has nothing to do with this ESP32-S3 target, so `idf_env.py` exports the required paths explicitly instead of downloading or modifying the tool installation. Inspect the resulting `build/project_description.json` and component resolution rather than assuming a globally installed IDF version.
+## ESP-IDF 布局
 
-## The AI deck
+`tools/idf_env.py` 描述以下本地依赖，不负责安装或下载：
 
-Three tools serve the four-button interfaces, and they are separate because
-they fail for separate reasons.
+- ESP-IDF 5.4.2：`.tools/esp-idf-clean`。
+- IDF 工具目录：`.tools/idf-tools`。
+- Python 环境：工具目录下的 `python_env/idf5.4_py3.10_env`。
+- Xtensa GCC 14.2.0：`esp-14.2.0_20241119` 工具包。
+- CMake 3.30.2、Ninja 1.12.1、ESP ROM ELF 20241011。
 
-```powershell
-$env:MIXOS_SSH_PASSWORD='...'
-py -3.12 tools/inventory_pi.py --host 192.168.1.22    # read-only; no sudo, no writes
-py -3.12 tools/stage_models.py                        # download here, where the network works
-py -3.12 tools/deploy_models.py --host 192.168.1.22   # send, resumably, and verify on the device
-py -3.12 tools/stage_speech.py                        # the speech-recognition models, same reason
-py -3.12 tools/deploy_speech.py --host 10.12.194.1 --block-mb 64
-py -3.12 tools/usb_gadget.py   --status --host 192.168.1.22   # which USB arrangement the device is in
-py -3.12 tools/deploy_apps.py  --host 192.168.1.22    # interfaces, launchers, units, polkit rule
-```
+准备依赖后运行 `python tools/idf_env.py` 检查派生路径。它不检测安装完整性；工具包目录名和 Python 环境名是源码常量，没有分别覆盖各目录的命令行选项。
 
-`inventory_pi.py` writes its answers into `docs/AI_DECK.md` between the
-`inventory` markers and keeps the raw output under `build/inventory/`.
-`stage_models.py` and `deploy_models.py` both resume: the measured rates are
-2.8 MB/s from the mirror to this machine and 0.20 MB/s from here to the device
-over Wi-Fi, so neither transfer is something to start over. `usb_gadget.py`
-switches the CM5 between driving the internal hub and being a USB network
-adapter, which turns that second rate into tens of MB/s at the cost of the
-screen and keyboard while it is active; Wi-Fi stays up in both arrangements, so
-the device cannot be stranded. `deploy_apps.py --check-only` reports what is on
-the device without changing anything, and `--print-script` shows the one
-privileged step without connecting at all.
+驱动显式设置 IDF 环境，不调用 `export.sh`，并设置 `IDF_SKIP_CHECK_SUBMODULES=1`。这只跳过 IDF 的子模块检查，不会补齐缺失内容；新环境仍须准备目标构建所需文件和 Python 依赖。
 
-`stage_speech.py` and `deploy_speech.py` are the same pattern for the speech
-models, and they exist because `mixos-aiserver.service` runs with
-`IPAddressDeny=any`: `moonshine_voice` downloads a model on first use, inside
-the request handler that is trying to transcribe or speak, and on that unit the
-download cannot succeed at all. Both directions are covered - recognition and
-synthesis - and the models have to be on disk before the first press of the
-microphone button. Two details about `download.moonshine.ai`, both measured
-2026-09-13: it answers `HEAD` with 403, so sizing files that way reports every
-model as forbidden, and it rejects the default `urllib` user agent with 403
-while serving the identical request to a browser agent. The staging tool sends
-a browser agent and sizes files with a one-byte ranged `GET`.
+Linux／WSL 脚本 `tools/build_esp_local.sh` 可用 `MIXOS_PYTHON` 指定读取环境配置的 Python。该脚本的 `--clean` 会删除 ESP 默认构建目录；它不保存恢复文件，也不生成发布来源记录。正式构建前提和记录流程见[构建指南](BUILD.md)。
 
-## Windows upload/font tools
-Python: `C:/Users/123/AppData/Local/Programs/Python/Python312/python.exe`. OpenSSH/SCP use the previously verified host key for the CM5 at `192.168.1.22`; neither uploader auto-accepts an unknown host key. Credentials are supplied through `MIXOS_SSH_PASSWORD` and a temporary askpass helper, not saved in release manifests.
+## QMK 与 ARM 工具链
 
-The CM5 has `dfu-util 0.11` and pyserial 3.5. The WSL dfu-util package is 0.9 and is **not** the approved production keyboard flashing tool; real USB devices are reached through the CM5 in internal Host mode.
+使用 QMK 0.28.0，完整 commit 见[来源说明](SOURCES.md)。默认目录为 `.tools/qmk-0.28.0`，可由 `tools/build_keyboard.py --qmk-root /path/to/qmk` 更换；显式指定时使用绝对路径。
+
+准备固定版本的 ChibiOS、ChibiOS-Contrib、printf、LUFA 子模块，以及 QMK 的 Python 依赖、make、ARM newlib 和 `arm-none-eabi` 工具。参考工具版本为 ARM GCC 10.3.1（Ubuntu 包 `15:10.3-2021.07-4`）、binutils 2.38；驱动记录实际版本，但不强制这些编译器版本。
+
+QMK 使用独立虚拟环境并在 Linux／WSL 中执行。完整构建还需本机 C 编译器；这一驱动使用 `CC`，而非 `MIXOS_HOST_CC`。`--jobs` 控制并行数，默认 4。驱动会替换指定 QMK 目录中的目标键盘副本，应使用专门构建工作区。
+
+## 字体与渲染依赖
+
+源字体和图标字体需要单独取得并核对授权；安装 Python 包不会自动获得字体。构建器支持 `--icons` 指定图标字体，默认查找 `build/icons/MaterialSymbolsRounded.ttf`。
+
+`MIXOS_TEST_FONT` 开启固定 MiSans 输入的集成测试；`MIXOS_TEST_RENDER_FONT` 开启真实字体渲染测试。它们不替代字体构建的输入参数。接口、固定输入限制和原生 FreeType 依赖见[字体构建](FONT_BUILD.md)及[渲染测试](ESP_FONT_BUILD.md)。
+
+## 设备侧工具
+
+这些工具与离线检查分开使用，执行前先查看各自 `--help`，核对 `--host`、`--user`、远端目录和操作权限：
+
+- `tools/inventory_pi.py` 通过 SSH 查询设备；默认还写本地文档，`--print-only` 可避免这一步，但仍连接设备。
+- `tools/stage_models.py`、`tools/stage_speech.py` 在本机下载模型；对应的 `deploy_models.py`、`deploy_speech.py` 负责传输和校验。
+- `tools/deploy_apps.py --print-script` 离线显示安装脚本；`--check-only` 连接设备检查现状；安装和启用服务需单独授权。
+- `tools/usb_gadget.py` 涉及 USB Host／Gadget 模式；切换可能影响内部屏幕、键盘和设备访问，不能当作普通网络加速选项。
+
+SSH 工具使用 OpenSSH 主机密钥校验，部分支持 `MIXOS_SSH_PASSWORD` 和临时 askpass。保持主机身份校验，不把凭据写入文档或发布清单。
+
+部分部署脚本仍绑定远端账户目录、服务安装位置或设备默认地址，不能仅替换 `--host` 就视为通用安装器。实际使用见[部署指南](DEPLOYMENT.md)和[应用说明](AI_DECK.md)；本页不提供自动刷写流程。

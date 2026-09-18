@@ -1,13 +1,23 @@
-# MixOS offline UI preview
+# MixOS 离线界面预览
 
-Double-click `index.html`, or open it from your browser. Everything is embedded in this one file; no internet, dependencies or server are required.
+直接用浏览器打开 [index.html](index.html)。页面内置全部 HTML、CSS 和 JavaScript，无需联网、依赖安装或本地服务器。
 
-- Start with **Offline / unknown**, then select **Connected / MOCK data** to try simulated telemetry and a terminal session.
-- Use the bottom navigation for Home, Power, Terminal, Device and Settings.
-- Settings has English/Chinese, four persisted themes, mock brightness/backlight and explicit local maintenance confirmation.
-- In the mock terminal, try `help`, `status`, `中文` and `history`. The grid is 80×28; scrollback is capped at 100 lines. Shift+PageUp/Down scrolls locally.
-- Device has a single-pointer touch test, including pointer-release/cancel handling.
-- Maintenance and update requests require local confirmation. Escape rejects; Enter confirms. No command is actually executed, and terminal output cannot confirm anything.
-- Capacity/runtime stay unavailable because calibration is not verified. Named preview sensors are illustrative, not a statement of real hardware presence.
+## 可以体验什么
 
-Run the dependency-free interaction checks with `node tests/test_preview.cjs` from the MixOS root. See `docs/ui-implementation.md` for firmware integration, memory use, test details and known limitations.
+- 在 Offline／unknown 与 Connected／MOCK data 之间切换，查看未知状态和模拟遥测。
+- 使用 Home、Power、Terminal、Device、Settings 五页演示布局。
+- 切换中英文和四种主题，试用模拟亮度、背光与本地维护确认。
+- 在模拟终端输入 `help`、`status`、`中文`、`history`；网格为 80×28，历史上限为 100 行，支持 Shift+PageUp／PageDown。
+- 使用单指针触控测试，检查按下、释放和取消交互。
+
+所有数据和操作都是模拟，不执行命令、不访问设备。模拟传感器名称不表示实际板上器件，容量与续航也不会被当作已校准数据。
+
+## 与固件的区别
+
+预览是独立的界面演示，并非固件渲染器。当前固件使用应用首页、分组设置和两档终端尺寸，与这里保留的五页布局不同。模拟维护确认也不代表实际更新工具的授权流程。
+
+浏览器使用本机字体，外观不与嵌入式字体逐像素一致。预览适合主题与交互检查，不用于证明当前固件功能、实体 LCD 或其他硬件正常。
+
+## 检查
+
+在仓库根目录运行 `node tests/test_preview.cjs`，执行无需第三方依赖的交互检查。固件集成、内存与渲染说明见[界面实现](../../docs/ui-implementation.md)。
