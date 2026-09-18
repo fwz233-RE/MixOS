@@ -1,0 +1,28 @@
+{
+  "upstream": "https://github.com/google-gemma/gemma-translator",
+  "commit": "47f9b3ba40ca3650fb80ee42264a76d6a2b5f8ba",
+  "commit_date": "2026-08-14T15:47:24Z",
+  "license": "Apache-2.0",
+  "retrieved": "2026-09-13",
+  "upstream_paths": {
+    "server.py": "backend/server.py",
+    "requirements.txt": "backend/requirements.txt",
+    "LICENSE": "LICENSE"
+  },
+  "modified": false,
+  "note": "Byte-exact copies. MixOS never edits these; every deviation lives in linux/apps/translator/service.py.",
+  "files": {
+    "server.py": {
+      "bytes": 19701,
+      "sha256": "4a582db4a59e85d5daaac20b8f6743ffdcea3e0148dc2ec6e77109f5c0b30b68"
+    },
+    "requirements.txt": {
+      "bytes": 710,
+      "sha256": "4ee89aa2bbf3edfc447a5b3ef022ff3c7c1952ac5a1585f2c85edb13406bd94b"
+    },
+    "LICENSE": {
+      "bytes": 11359,
+      "sha256": "8c6db340475136df3c1201d458fa5755698eace76e510471ecc9d857d6083dac"
+    }
+  }
+}

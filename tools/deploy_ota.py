@@ -1,24 +1,17 @@
 #!/usr/bin/env python3
-"""Update the ESP32-S3 over USB in one command, through the CM5, over SSH.
+"""Optional SSH transport for the same Linux-native ESP update job/status API.
 
-This is the routine path once the device runs the A/B layout. Nothing is
-erased until the whole image arrived and its SHA-256 matched, the running slot
-is never touched, and a build that does not prove itself is rolled back by the
-bootloader. There is no backup ceremony, no ROM download mode, no esptool and
-no 4 MiB font rewrite, because none of those are involved.
-
-    export MIXOS_SSH_PASSWORD=...
-    tools/deploy_ota.py --image firmware/esp32s3/build/mixos_esp32s3.bin
-
-Compare with tools/deploy_display.py, which is the once-per-device serial
-operation that installs the bootloader, the A/B partition table and the font.
-
-Exit status is the update's status: this tool runs to completion instead of
-submitting a detached job, because an interrupted OTA leaves the running build
-in place by construction.
+A validated release directory (app.bin + manifest.json) is the deployable unit.
+Use --package for a release without a source checkout, or --image --manifest to
+package a checked local build. --image --dry-run retains the old local build
+consistency check. --skip-build-check never replaces the required release
+manifest for an actual apply. The worker is systemd-managed and survives SSH
+loss; this wrapper never stops services, opens serial, or interprets firmware
+success itself. No ROM/bootstrap operation is selected by a timeout.
 """
 import argparse
 import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -27,33 +20,26 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from deploy_display import digest, source_digest_matches  # noqa: E402
-import ota_esp  # noqa: E402
+from deploy_display import digest, source_digest_matches
+import ota_esp
+import mixos_esp_update as native
 
 ROOT = Path(__file__).resolve().parents[1]
-# The CDC interface published by this device's udev rule and mixosd unit.
-DEVICE = '/dev/serial/by-id/usb-TypixDeck_TypixDeck_UAC+CDC_TD0720-if03'
-SERVICE = 'mixosd.service'
-# Every A/B application slot in firmware/esp32s3/partitions.csv.
-SLOT_BYTES = 0x1F0000
-# What travels to the Pi. The updater imports protocol.py and mixosd.py from a
-# sibling linux/ directory, so the package mirrors the repository layout.
-PAYLOAD = {'tools/ota_esp.py': 'tools/ota_esp.py',
-           'linux/protocol.py': 'linux/protocol.py',
-           'linux/mixosd.py': 'linux/mixosd.py'}
+DEVICE = native.DEVICE
+SERVICE = native.SERVICE
+SLOT_BYTES = native.SLOT_SIZE
+PAYLOAD = {name: name for name in native.RUNNER_FILES}
+# Kept for the existing installation/package compatibility check. The serial
+# transport itself is now standalone and imports neither daemon nor netctl.
+PAYLOAD.update({'linux/netctl.py': 'linux/netctl.py', 'linux/mixosd.py': 'linux/mixosd.py'})
 
 
 def build_check(image):
-    """Refuse to push anything the local build report does not vouch for.
-
-    An OTA cannot damage the device, but it can waste a trip by installing an
-    image whose sources were edited after the last cross-build, which is the
-    mistake that is easy to make and hard to see afterwards.
-    """
+    """Attest local source/image consistency, independently of runtime safety."""
     path = ROOT / 'build/esp32s3/font-app-build.json'
     report = json.loads(path.read_text(encoding='utf-8'))
     if (report.get('status') != 'cross-built' or report.get('target') != 'esp32s3'
@@ -73,54 +59,89 @@ def build_check(image):
             'build_report_sha256': digest(path)}
 
 
-def remote_command(package, device, timeout):
-    """Stop the host service, update as the ordinary user, restart it either way.
+def remote_command(package, device, timeout, allow_replace_baseline=False):
+    """Ordinary-user submit/follow only; systemd owns the worker's lifetime."""
+    command = ['/usr/bin/python3', '-I', '-u', package + '/tools/mixos_esp_update.py',
+               'apply', '--package', package, '--device', device,
+               '--timeout', str(timeout), '--wait']
+    if allow_replace_baseline:
+        command.append('--allow-replace-baseline')
+    return shlex.join(command) + '\n'
 
-    mixosd holds the CDC node, so it has to stand aside; the updater itself
-    never runs as root, and the service comes back even when the update fails.
-    """
-    update = shlex.join(['/usr/bin/python3', '-I', '-u', package + '/tools/ota_esp.py',
-                         '--device', device, '--image', package + '/app.bin',
-                         '--timeout', str(timeout)])
-    return ('set -u\n'
-            'systemctl stop ' + shlex.quote(SERVICE) + '\n'
-            'runuser -u pi -- ' + update + '\n'
-            'status=$?\n'
-            'systemctl start ' + shlex.quote(SERVICE) + '\n'
-            'exit $status\n')
+
+def status_command(package, job):
+    if not native.JOB_ID.fullmatch(job):
+        raise ValueError('invalid native job ID')
+    return shlex.join(['/usr/bin/python3', '-I', '-u', package + '/tools/mixos_esp_update.py',
+                       'status', '--job', job]) + '\n'
+
+
+def parse_result(output):
+    """The last native JSON result is authoritative, including queued/unknown."""
+    found = None
+    for line in (output or '').splitlines():
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(value, dict) and all(k in value for k in ('firmware', 'service', 'error')):
+            found = value
+    if found is None:
+        return dict(state='unknown', durable=False, firmware={'state': 'unknown'},
+                    service={'state': 'unknown'}, error={'code': 'transport-unknown',
+                    'message': 'SSH returned no native result; the background job may still be running. Use status; do not reflash blindly.'})
+    return found
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--image', type=Path, default=ROOT / 'firmware/esp32s3/build/mixos_esp32s3.bin',
-                   help='application .bin to install (default: the current cross-build)')
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('--image', type=Path, default=ROOT / 'firmware/esp32s3/build/mixos_esp32s3.bin')
+    p.add_argument('--manifest', type=Path, help='v2 manifest produced from the effective build configuration')
+    p.add_argument('--package', type=Path, help='portable app.bin + manifest.json release directory')
     p.add_argument('--host', default='192.168.1.22')
-    p.add_argument('--device', default=DEVICE, help='CDC node on the Pi')
-    p.add_argument('--timeout', type=float, default=60.0, help='per-step timeout on the Pi')
-    p.add_argument('--dry-run', action='store_true',
-                   help='validate the image and the build report, then stop')
-    p.add_argument('--skip-build-check', action='store_true',
-                   help='install an image the local build report does not describe')
+    p.add_argument('--device', default=DEVICE)
+    p.add_argument('--timeout', type=float, default=60.0)
+    p.add_argument('--dry-run', action='store_true', help='validate locally; no network, serial or services')
+    p.add_argument('--skip-build-check', action='store_true', help='skip source consistency only, not manifest validation')
+    p.add_argument('--allow-replace-baseline', action='store_true')
+    p.add_argument('--status', metavar='JOB', help='read the native durable status of a previous job')
+    p.add_argument('--remote-package', help='remote release directory from the prior transport receipt')
     a = p.parse_args(argv)
-
     try:
-        image, image_digest = ota_esp.inspect_image(a.image)
-    except ota_esp.UpdateError as exc:
+        native.validate_device_path(a.device)
+        native.finite_seconds(a.timeout, 'timeout', 0.01, 120)
+        if a.status:
+            if not a.remote_package or not a.remote_package.startswith('/home/pi/'):
+                raise ValueError('--status needs the prior --remote-package under /home/pi/')
+            status_command(a.remote_package, a.status)
+            provenance = None
+        elif a.package:
+            release = native.load_release(a.package)
+            provenance = release.manifest['provenance']
+        else:
+            image, sha = ota_esp.inspect_image(a.image)
+            if not a.dry_run:
+                ota_esp.describe_image(image)
+            if len(image) > SLOT_BYTES:
+                raise ValueError(f'{len(image)} bytes does not fit a {SLOT_BYTES} byte slot')
+            provenance = {'mode': 'unverified_image', 'app_sha256': sha.hex()}
+            if not a.skip_build_check:
+                provenance = build_check(a.image)
+            if not a.dry_run and not a.manifest:
+                raise ValueError('actual apply requires --manifest or --package; a raw image cannot establish a safe release')
+        # A supplied manifest must be checked even for dry-run.
+        if not a.status and not a.package and a.manifest:
+            with tempfile.TemporaryDirectory(prefix='mixos-ota-validate-') as temporary:
+                temp = Path(temporary)
+                (temp / 'app.bin').write_bytes(image)
+                (temp / 'manifest.json').write_bytes(a.manifest.read_bytes())
+                release = native.load_release(temp)
+    except (OSError, ValueError, ota_esp.UpdateError, native.JobError) as exc:
         p.error(str(exc))
-    if len(image) > SLOT_BYTES:
-        p.error(f'{len(image)} bytes does not fit a {SLOT_BYTES} byte slot')
-    provenance = {'mode': 'unverified_image', 'app_sha256': image_digest.hex()}
-    if not a.skip_build_check:
-        provenance = build_check(a.image)
-
-    print(f'image  {a.image}')
-    print(f'size   {len(image)} bytes of {SLOT_BYTES} ({len(image) * 100 // SLOT_BYTES}% of a slot)')
-    print(f'sha256 {image_digest.hex()}')
-    if not a.device.startswith('/dev/serial/by-id/'):
-        p.error('use an explicit stable /dev/serial/by-id/ identity')
     if a.dry_run:
-        print('DRY RUN: nothing was uploaded and no device was opened.')
+        print(json.dumps(dict(dry_run=True, artifact_provenance=provenance,
+                              firmware={'state': 'not-started'}, service={'state': 'untouched'},
+                              error=None), sort_keys=True))
         return 0
 
     password = os.environ.get('MIXOS_SSH_PASSWORD')
@@ -130,9 +151,9 @@ def main(argv=None):
                '-o', 'ServerAliveCountMax=3', '-o', 'StrictHostKeyChecking=yes',
                '-o', 'PreferredAuthentications=password', '-o', 'PubkeyAuthentication=no',
                '-o', 'NumberOfPasswordPrompts=1']
-    job = 'mixos-ota-' + time.strftime('%Y%m%d-%H%M%S', time.gmtime())
-    staging = '/home/pi/' + job
-
+    transfer = 'mixos-ota-' + time.strftime('%Y%m%d-%H%M%S', time.gmtime()) + '-' + uuid.uuid4().hex[:8]
+    staging = a.remote_package if a.status else '/home/pi/' + transfer
+    hashes = {}
     with tempfile.TemporaryDirectory(prefix='mixos-ota-') as temporary:
         temp = Path(temporary)
         helper = temp / ('askpass.cmd' if os.name == 'nt' else 'askpass.sh')
@@ -141,62 +162,60 @@ def main(argv=None):
         helper.chmod(0o700)
         env = dict(os.environ, SSH_ASKPASS=str(helper), SSH_ASKPASS_REQUIRE='force', DISPLAY='unused:0')
 
-        def ssh(script, sudo=False, timeout=180, check=True):
+        def ssh(script, timeout=180, check=True):
             encoded = base64.b64encode(script.encode()).decode()
             command = 'echo ' + encoded + ' | base64 -d | bash'
-            if sudo:
-                command = "sudo -S -p '' bash -c " + shlex.quote(command)
-            result = subprocess.run(['ssh', '-T'] + options + ['pi@' + a.host, command],
-                                    env=env, input=(password + '\n') if sudo else '',
-                                    text=True, timeout=timeout)
-            if check and result.returncode:
-                raise RuntimeError(f'SSH operation exited {result.returncode}')
-            return result.returncode
+            answer = subprocess.run(['ssh', '-T', *options, 'pi@' + a.host, command],
+                                    env=env, input='', text=True, capture_output=True, timeout=timeout)
+            if check and answer.returncode:
+                raise RuntimeError(f'SSH operation exited {answer.returncode}: {answer.stderr}')
+            return answer
 
-        files = {name: ROOT / source for name, source in PAYLOAD.items()}
-        files['app.bin'] = a.image
-        hashes = {name: digest(path) for name, path in files.items()}
-        archive = temp / 'ota.zip'
-        with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as z:
-            for name, path in files.items():
-                z.write(path, name)
-
-        ssh('set -eu\nmkdir -m 700 ' + shlex.quote(staging))
-        uploaded = subprocess.run(['scp'] + options + [str(archive), 'pi@' + a.host + ':' + staging + '/package.zip'],
-                                  env=env, timeout=300)
-        if uploaded.returncode:
-            raise RuntimeError('Upload failed; the device was never opened')
-        bootstrap = ('from pathlib import Path; import hashlib,zipfile; '
-                     f'p=Path({staging!r}); z=p/"package.zip"; '
-                     f'assert hashlib.sha256(z.read_bytes()).hexdigest()=={digest(archive)!r}; '
-                     'zipfile.ZipFile(z).extractall(p); '
-                     f'assert all(hashlib.sha256((p/n).read_bytes()).hexdigest()==h '
-                     f'for n,h in {hashes!r}.items())')
-        ssh(shlex.join(['python3', '-c', bootstrap]))
-
-        print(f'updating over USB via {a.host}; the running slot stays intact')
-        status = ssh(remote_command(staging, a.device, a.timeout), sudo=True,
-                     timeout=max(600.0, a.timeout * 8), check=False)
-
-        receipt = ROOT / 'build/deploy' / (job + '.json')
-        receipt.parent.mkdir(parents=True, exist_ok=True)
-        receipt.write_text(json.dumps({'job': job, 'host': a.host, 'staging': staging,
-                                       'device': a.device, 'hashes': hashes,
-                                       'state': 'installed' if not status else 'failed',
-                                       'artifact_provenance': provenance}, indent=2) + '\n')
-        if status:
-            print(f'\ndeploy_ota: the update did not complete (exit {status}). The device is '
-                  f'still running its previous build; {SERVICE} was restarted.', file=sys.stderr)
-            print('deploy_ota: if it timed out waiting for OTA_READY, the running firmware '
-                  'predates USB updates. Install it once with '
-                  'tools/deploy_display.py --stage --migrate, then this tool works from then on.',
-                  file=sys.stderr)
-            print('receipt ' + str(receipt), file=sys.stderr)
-            return status
-        print('INSTALLED: the new build is running and confirms itself after about 20 s of '
-              'health. A build that crashes before then is rolled back by the bootloader.')
-        print('receipt ' + str(receipt))
-    return 0
+        if not a.status:
+            # Archive exactly the validated bytes; never reread a mutable
+            # source app/manifest after validation and call it the same package.
+            files = {name: (ROOT / source).read_bytes() for name, source in PAYLOAD.items()}
+            files['app.bin'] = release.image
+            files['manifest.json'] = (json.dumps(release.manifest, sort_keys=True) + '\n').encode()
+            hashes = {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
+            archive = temp / 'ota.zip'
+            with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as z:
+                for name, data in files.items():
+                    z.writestr(name, data)
+            ssh('set -eu\nmkdir -m 700 ' + shlex.quote(staging))
+            uploaded = subprocess.run(['scp', *options, str(archive), 'pi@' + a.host + ':' + staging + '/package.zip'],
+                                      env=env, timeout=300)
+            if uploaded.returncode:
+                raise RuntimeError('Upload failed; the device was never opened')
+            bootstrap = ('from pathlib import Path; import hashlib,zipfile; '
+                         f'p=Path({staging!r}); z=p/"package.zip"; '
+                         f'assert hashlib.sha256(z.read_bytes()).hexdigest()=={digest(archive)!r}; '
+                         'zipfile.ZipFile(z).extractall(p); '
+                         f'assert all(hashlib.sha256((p/n).read_bytes()).hexdigest()==h for n,h in {hashes!r}.items()); '
+                         '(p/"linux/mixos-esp-update").chmod(0o755)')
+            ssh(shlex.join(['python3', '-c', bootstrap]))
+        command = (status_command(staging, a.status) if a.status else
+                   remote_command(staging, a.device, a.timeout, a.allow_replace_baseline))
+        transport_error = None
+        try:
+            answer = ssh(command, timeout=1000, check=False)
+            result = parse_result(answer.stdout)
+            if answer.returncode not in (0, 1, 2):
+                transport_error = f'SSH exited {answer.returncode}; worker lifetime is independent'
+        except subprocess.TimeoutExpired as exc:
+            output = exc.stdout.decode('utf-8', 'replace') if isinstance(exc.stdout, bytes) else exc.stdout
+            result = parse_result(output)
+            transport_error = 'SSH wait timed out; background job outcome must be read with status'
+        receipt = ROOT / 'build/deploy' / (transfer + '.json')
+        native.atomic_json(receipt, dict(host=a.host, staging=staging, device=a.device, hashes=hashes,
+                           artifact_provenance=provenance, result=result, transport_error=transport_error))
+        print(json.dumps(result, sort_keys=True))
+        print('receipt ' + str(receipt), file=sys.stderr)
+        code = native.result_exit_code(result)
+        if transport_error:
+            print(transport_error + '; do not start another transfer blindly.', file=sys.stderr)
+            return code if code else 1
+        return code
 
 
 if __name__ == '__main__':

@@ -1,5 +1,29 @@
 # ESP host-authorized update build
 
+## 最新实机状态：2026-09-18 十次连续交替已通过
+
+`normal-alternation-readverify-20260918` 已连续完成十次正常免按键更新，完整镜像身份、A/B 槽位、新启动、VALID、维护确认、持续心跳和服务恢复逐轮通过。1779 次实际测量中两次无回复各由一次严格有界只读重测恢复，原始字节与诊断已独立关联；旧中断任务及恢复不计入本次十次。最新全量回归：Linux 1061 通过／4 跳过，Windows 1050 通过／15 跳过，部署主机代码与测试输入一致。
+
+已发布并实际检查 Linux 命令 `/usr/local/bin/mixos-esp-update`；正式入口的最终实时查询仍为 A `ota_0 / VALID`、ELF `532717dd…`、启动 ID `647101243`，服务恢复 active，没有额外刷写或复位。当前面板版本 `532717dd` 及画面正常已由用户确认。正常更新及有限通信恢复已通过；用户选择保留当前良好设备，准备备用板或独立复位通道后，再单独进行尚未完成的故障镜像、主动链路故障、受控断电验收。使用方法见 [ESP_OTA.md](ESP_OTA.md)，完整证据和保留的审计失败说明见 [DEPLOYMENT.md](DEPLOYMENT.md)。以下早期构建与验收状态仅保留历史含义。
+
+## 历史实机状态：五轮连续成功，第六轮经原事务恢复
+
+2026-09-17 晚间已确认 Linux 原生任务连续完成五次免按键交替更新；第六次新 B 已启动但 USB 通信未恢复，监管任务停止。用户确认屏幕仍正常变化，并另行授权一次仅针对 ESP 子设备的 USB 总线复位；随后原事务经 `apply --resume` 完成精确文件／ELF、VALID、维护确认、持续心跳及服务恢复，没有重新上传镜像。旧监管失败记录保持不变，十轮连续验收尚未通过。正在加入固件重启前显式 USB 断开，详见 [DEPLOYMENT.md](DEPLOYMENT.md) 最新状态与独立证据；旧 A 已获准替换，外部完整备份仍保留。以下首次 B 及更早构建记录均为历史证据。
+
+## 历史里程碑：首次 B 确认通过
+
+2026-09-17 17:33（UTC+8），`observe-health-ack-20260917` 在不复位、不重新刷写的情况下确认实际运行 `ota_1 / VALID`，应用文件 `7beaccda…`、ELF `155c46f4…` 均精确匹配新 HEALTH_ACK 固件。实际维护确认成功后持续收到 9 次心跳，跨度 16.172 秒；服务已恢复，任务和清理退出 0，用户确认实体 LCD 正常。证据已下载并独立核验：`build/deploy/ota-acceptance-20260916-1749/observe-existing-local-verification.json`。用户已授权满足这些条件后解除旧 A 保护并继续 10 次正常交替验收，故障／断电注入仍不在授权内。下文历史的“尚未写入／待验收”不再代表首次 B 的当前状态；完整计划仍未验收完成。
+
+> 本页保留 2026-09-11 主机授权进入 ROM 的历史构建与部署证据，不代表当前候选或设备状态。2026-09-16 早先曾验证恢复镜像 `cfacb3fe… / ota_0 / VALID` 并确认实体显示正常；2026-09-17 的后续无写入资格测试现已通过应用→同一芯片 ROM→双 8 MiB 读回→单次官方复位→精确 A／VALID／持续心跳／服务恢复；下载证据已独立核对与恢复快照零差异。这只证明该资格闭环通过，B 候选尚未写入。最新状态见 [DEPLOYMENT.md](DEPLOYMENT.md)，新版应用 A/B 事务与首次安装条件见 [ESP_OTA_V2.md](ESP_OTA_V2.md)。
+
+## 2026-09-17 维护往返确认修复（实机待验收）
+
+当前源码新增 `HEALTH_ACK`（操作码 8、能力位 `0x10`）：主机在 PENDING 时先测量实际运行文件，核对完整文件 SHA、ELF、长度、槽位和本次启动身份，再回送维护任务发出的随机挑战；固件收到匹配确认后，仍需连续 20 秒本地功能和链路健康，并且写入 VALID、复查 VALID 均成功，才结束试运行。主机再持续观察心跳并核实实际状态。ACK 回复丢失记录未知，不自动重发 ACK、刷写或复位。
+
+链路断开、OTA 请求的维护 session 改变、错误或畸形 VERIFY／ACK 会撤销该临时确认。CAPS／IDENTIFY 只是链路层查询，既不授予确认，也不单独切换工作任务的 OTA session。旧 `faafb49…` 启动保护候选不含此修复，不能作为本轮最终安装候选。
+
+首次 B 失败后如果观察到精确受保护 A／VALID，主机会在一次身份查询前后分别验证心跳，保存独立失败恢复记录并恢复服务，进程退出码仍为 2；这不证明 B 启动成功或自动回滚原因。当前板一次保留 A 的 B 安装及独立启动已获风险授权，但新候选必须先完成隔离构建、来源及测试绑定检查，再签发精确包的一次性审批。原始 A ELF 和独立 EN／BOOT 不是正常首次实验的统一前置条件；任意死机恢复和高风险故障测试仍需独立硬件或合适备用板。
+
 ## Firmware behavior
 
 This change supersedes the mandatory on-device confirmation described in older update documentation. An explicit administrator update request on the established maintenance protocol now receives `UPDATE_READY` automatically. The host remains responsible for authorizing its operator (`--execute` and the deployment launcher's existing administrative policy). The USB maintenance protocol does not cryptographically authenticate the peer.
@@ -8,7 +32,7 @@ Only an online link's `PREPARE_UPDATE` on maintenance channel 4, with a nonzero 
 
 `PREPARE_UPDATE` does not boot. Only an empty `ENTER_BOOT` with the matching channel, epoch and granted request/session, a fresh sequence, and an unexpired grant requests ROM entry. The grant is consumed before the boot request is published, and the public boot-request accessor consumes that request once. Disconnect, link restart, heartbeat timeout and grant expiry revoke the grant. No new PREPARE is accepted while a boot request is still awaiting consumption.
 
-`mix_link_update_answer()` remains as a no-op for source compatibility with the UI action dispatcher. Firmware-generated view state never requests an update-confirmation modal. The old UI modal and help strings were inspected but left byte-for-byte unchanged to avoid a font rebuild and unrelated UI changes. Other local confirmations, such as starting a host job, are unchanged.
+当前 `mix_link` 自动授权路径不再提供 `mix_link_update_answer()`；UI 不参与主机更新批准。PREPARE／ENTER_BOOT 与应用 A/B 事务是两套不同操作，正在接收或选择启动槽的事务会阻止 ROM 准备请求。历史 UI 模态框文字不构成当前协议行为；其它本地确认仍独立处理。
 
 ## Scope
 

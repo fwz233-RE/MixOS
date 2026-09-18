@@ -1,5 +1,6 @@
 #include "mix_keyboard.h"
 #include "mix_kbd_transport.h"
+#include "mix_i2c.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -7,19 +8,24 @@ static mix_kbd_transport_t stm;
 static unsigned transactions, reads, emitted;
 static uint8_t output[4096];
 static bool fail_read, fail_ack, inject, corrupt_seq, bad_version, corrupt_crc, reset_on_text;
-esp_err_t i2c_master_bus_add_device(i2c_master_bus_handle_t bus,const i2c_device_config_t *cfg,i2c_master_dev_handle_t *out) {
-    assert(bus && cfg->device_address==0x1f && cfg->scl_speed_hz==400000); *out=(void *)2; return ESP_OK;
+/* The driver reaches the bus through mix_i2c, which owns the bus handle and
+ * serialises every transfer, so the fakes live at that boundary now. They keep
+ * the same assertions the previous IDF-level fakes made: the slave address,
+ * the 400 kHz rate, the single-register read of a whole frame, and the 5 ms
+ * deadline are all still checked here. */
+i2c_master_dev_handle_t mix_i2c_add_device(uint8_t address, uint32_t scl_hz) {
+    assert(address==0x1f && scl_hz==400000); return (void *)2;
 }
-esp_err_t i2c_master_bus_rm_device(i2c_master_dev_handle_t d) { assert(d); return ESP_OK; }
-esp_err_t i2c_master_transmit(i2c_master_dev_handle_t d,const uint8_t *p,size_t n,int timeout) {
+esp_err_t mix_i2c_rm_device(i2c_master_dev_handle_t d) { assert(d); return ESP_OK; }
+esp_err_t mix_i2c_transmit(i2c_master_dev_handle_t d,const uint8_t *p,size_t n,int timeout) {
     assert(d && timeout==5); ++transactions;
     if (fail_ack && p[0]==0x11) return ESP_FAIL;
     mix_kbd_transport_write(&stm,p,n);
     if(stm.backlight_pending) { stm.backlight=stm.pending_backlight; stm.backlight_pending=false; }
     return ESP_OK;
 }
-esp_err_t i2c_master_transmit_receive(i2c_master_dev_handle_t d,const uint8_t *p,size_t n,uint8_t *out,size_t len,int timeout) {
-    assert(d && n==1 && p[0]==0 && len==KBD_V1_FRAME && timeout==5); ++transactions; ++reads;
+esp_err_t mix_i2c_read(i2c_master_dev_handle_t d,uint8_t reg,uint8_t *out,size_t len,int timeout) {
+    assert(d && reg==0 && len==KBD_V1_FRAME && timeout==5); ++transactions; ++reads;
     if (fail_read) return ESP_FAIL;
     mix_kbd_transport_frame(&stm,out);
     if (bad_version) out[1]=0;
@@ -44,7 +50,7 @@ static void edge(unsigned r,unsigned c,bool down) { mix_kbd_transport_event(&stm
 static void setup(void) {
     mix_kbd_transport_init(&stm); emitted=reads=0;
     fail_read=fail_ack=inject=corrupt_seq=bad_version=corrupt_crc=reset_on_text=false;
-    assert(mix_keyboard_init((void *)1,cb,NULL)==ESP_OK);
+    assert(mix_keyboard_init(cb,NULL)==ESP_OK);
     tick(0); assert(!mix_keyboard_online()); tick(20); assert(mix_keyboard_online());
 }
 int main(void) {

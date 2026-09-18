@@ -18,6 +18,46 @@ void ttf_font_deinit(void);
 
 bool ttf_font_ready(void);
 
+// The mapped font partition, or NULL before a successful init. Valid until
+// ttf_font_deinit.
+#include <stddef.h>
+const void *ttf_font_data(size_t *len);
+
+// ---------------------------------------------------------------------------
+// Glyph access, for building an lv_font_t on top of this cache.
+//
+// LVGL 9.2's own FreeType binding cannot be used here. Its ESP component
+// declares only "REQUIRES esp_timer", so enabling LV_USE_FREETYPE compiles its
+// binding without FreeType's headers reachable; and the lv_fs-backed path it
+// would need (LV_FREETYPE_USE_LVGL_PORT) redefines FT_Stream_Open and the
+// FreeType allocators, which the espressif/freetype component already
+// provides. Rather than run a second FreeType, mix_lv_font.c wraps the cache
+// below, which is already tuned for this device.
+//
+// Same single-task rule as the rest of this file. Once LVGL owns drawing, the
+// only caller is the LVGL task; init runs before that task exists.
+// ---------------------------------------------------------------------------
+typedef struct {
+    const uint8_t *bitmap;   // w*h 8-bit alpha, NULL for blank glyphs
+    int16_t w, h;            // bitmap size in pixels
+    int16_t left, top;       // FreeType bitmap_left / bitmap_top bearings
+    int16_t advance;         // horizontal pen advance in pixels
+} ttf_glyph_t;
+
+typedef struct {
+    int16_t ascent;          // above the baseline, positive
+    int16_t descent;         // below the baseline, positive
+    int16_t line_height;     // at least ascent + descent
+} ttf_metrics_t;
+
+// Metrics at a pixel size. False when the font is unavailable.
+bool ttf_font_metrics(int size, ttf_metrics_t *out);
+
+// One rendered glyph. The bitmap stays owned by the cache and is valid until
+// the cache is flushed, which only happens inside another ttf_font_glyph or
+// draw call. False when the font is unavailable or the glyph cannot render.
+bool ttf_font_glyph(uint32_t codepoint, int size, ttf_glyph_t *out);
+
 // Draw one codepoint inside a fixed cell only; caller supplies its background.
 // Font metrics define a shared baseline; bearings and descenders are fitted,
 // including bold expansion. Cells are at most 64x64, height at least 2.

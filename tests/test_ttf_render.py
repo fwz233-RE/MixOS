@@ -88,9 +88,12 @@ class TtfRendererTests(unittest.TestCase):
         main = (ROOT / "firmware/esp32s3/main/main.c").read_text(encoding="utf-8")
         startup = main[main.index("void app_main(void)"):]
         self.assertLess(startup.index("ttf_font_init()"), startup.index("mix_ui_init(panel)"))
-        self.assertIn("if(font_err!=ESP_OK)ESP_LOGW", startup)
+        # A missing font now follows the bounded trial-reset / VALID USB
+        # maintenance policy; merely logging and continuing could confirm a
+        # candidate whose required local UI never initialized.
+        self.assertIn('if((e=ttf_font_init())!=ESP_OK){startup_failure("font initialization",e);maintenance_loop();}', startup)
         ui = (ROOT / "firmware/esp32s3/main/mix_ui.c").read_text(encoding="utf-8")
-        self.assertIn("ttf_draw_cell(fb,W,H,x,y,width,24,20,fg,cp,bold)", ui)
+        self.assertIn("ttf_draw_cell(fb,W,H,x,y,w,h,size,fg,cp,bold)", ui)
         self.assertNotIn("scratch[32*24]", ui)
 
 

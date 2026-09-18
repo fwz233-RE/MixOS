@@ -1,0 +1,16 @@
+#!/bin/sh
+# MixOS application launcher: live translation.
+#
+# mixosd runs this file with no arguments and never builds a command line (see
+# resolve_app in linux/mixosd.py): the button on the screen sends a one-byte
+# application identifier, which is looked up in a fixed table. Nothing a person
+# types can reach this file, and this file takes no input.
+#
+# MIXOS_APP_LIB exists so the interfaces can be run from a checkout during
+# development without installing them.
+set -eu
+
+LIB="${MIXOS_APP_LIB:-/opt/mixos/linux/apps}"
+PYTHON="${MIXOS_PYTHON:-/usr/bin/python3}"
+
+exec "$PYTHON" "$LIB/translator/app.py"

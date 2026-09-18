@@ -1,0 +1,54 @@
+#!/bin/sh
+# MixOS application launcher: notes, with Chinese input when it is available.
+#
+# term-ime is a virtual terminal with a built-in input method. It runs one
+# program, with no arguments, in a pseudo-terminal of its own, and converts
+# pinyin into 汉字 before the program ever sees them. That is exactly the shape
+# of this application, so the notes editor is that program.
+#
+# Two details of term-ime decide how it is started here:
+#
+#   * It takes the path to its configuration file as its first argument, and
+#     the `shell` key in that file is the program it runs. Writing our own file
+#     and passing it means the settings a person changes inside term-ime, which
+#     it saves to its own default path, can never redirect this launcher.
+#   * It keeps the bottom row of the screen for its candidate bar and gives the
+#     program one row less. The editor asks the terminal for its size rather
+#     than trusting MIXOS_ROWS, so this needs no coordination.
+#   * Where its pinyin dictionary lives is said, not searched for. Left empty,
+#     term-ime looks first at the directory it was compiled in, which on this
+#     device is /home/pi/mixos-ime/build; that works until the build tree is
+#     deleted and then stops working for no visible reason. RIME_DATA names the
+#     copy tools/build_ime_remote.py installs under /usr/local.
+#
+# When term-ime is not installed the editor runs directly. Everything works
+# except typing Chinese, which is worth saying out loud rather than failing.
+set -eu
+
+LIB="${MIXOS_APP_LIB:-/opt/mixos/linux/apps}"
+PYTHON="${MIXOS_PYTHON:-/usr/bin/python3}"
+APP="$LIB/notes/app.py"
+IME="${MIXOS_TERM_IME:-/usr/local/bin/term-ime}"
+RIME_DATA="${MIXOS_RIME_DATA:-/usr/local/share/term-ime/rime-data}"
+
+if [ -x "$IME" ] && [ -x "$APP" ] && [ -d "$RIME_DATA" ]; then
+    CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/mixos"
+    CONFIG="$CONFIG_DIR/term-ime-notes.json"
+    mkdir -p "$CONFIG_DIR"
+    # Regenerated on every start: the editor's path is the only thing in it
+    # that matters, and a stale copy pointing at an old install would run the
+    # wrong program.
+    cat > "$CONFIG" <<EOF
+{
+  "shell": "$APP",
+  "active_language": "zh-Hans",
+  "ui_language": "zh-CN",
+  "candidate_bar_position": "bottom",
+  "rime_shared_data_dir": "$RIME_DATA",
+  "log_level": "warn"
+}
+EOF
+    exec "$IME" "$CONFIG"
+fi
+
+exec "$PYTHON" "$APP"

@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Installed or bundled entry point for the Linux ESP updater."""
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
+from mixos_esp_update import main
+
+if __name__ == '__main__':
+    sys.exit(main())

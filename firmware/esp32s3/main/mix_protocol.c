@@ -32,7 +32,7 @@ bool mix_frame_decode(const uint8_t *wire,size_t n,mix_frame_t *f) {
         for(unsigned i=1;i<c;i++){if(w>=sizeof(raw)||!wire[r])return false;raw[w++]=wire[r++];}
         if(c!=255&&r<n){if(w>=sizeof(raw))return false;raw[w++]=0;}
     }
-    if(w<22||raw[0]!=1||raw[1]>MIX_CH_LOG||raw[3]!=0)return false;
+    if(w<22||raw[0]!=1||raw[1]>MIX_CH_MAX||raw[3]!=0)return false;
     uint16_t len=mix_get16(raw+16);
     if(len>MIX_MAX_PAYLOAD||w!=(size_t)len+22||mix_get32(raw+w-4)!=mix_crc32(raw,w-4))return false;
     f->channel=raw[1];f->type=raw[2];f->epoch=mix_get32(raw+4);f->session=mix_get32(raw+8);

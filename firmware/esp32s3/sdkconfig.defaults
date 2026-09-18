@@ -29,8 +29,10 @@ CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
 # CPU 240MHz，喂饱 RGB bounce buffer 的 memcpy
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 
-# RGB LCD ISR 放 IRAM，防止 flash 操作时断流
-CONFIG_LCD_RGB_ISR_IRAM_SAFE=y
+# RGB/GDMA 不声明 cache-off ISR 安全：RGB 仍需读取 PSRAM framebuffer。
+# 保留上面的 PSRAM XiP（包括 instructions/rodata），避免 flash 写入关闭 cache。
+CONFIG_LCD_RGB_ISR_IRAM_SAFE=n
+CONFIG_GDMA_ISR_IRAM_SAFE=n
 
 CONFIG_FREERTOS_HZ=1000
 # FreeType 光栅化在 app_main 栈上跑（gray raster 需 ~16-32KB，
@@ -58,10 +60,28 @@ CONFIG_UAC_TUSB_MANUFACTURER="TypixDeck"
 CONFIG_UAC_TUSB_PRODUCT="TypixDeck UAC+CDC"
 CONFIG_UAC_TUSB_SERIAL_NUM="TD0720"
 
-# ---- 中文 TTF 渲染（自绘 UI + FreeType，不用 LVGL）----
+# ---- 中文 TTF 渲染：LVGL 9 + FreeType，字形来自 font 分区 ----
 # 自定义分区表：ota_0 / ota_1 各 1984KB + font 4MB（普惠体 GB2312 子集 TTF）
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---- LVGL ----
+# 面板是 RGB565，LVGL 的绘图缓冲就是面板自己的两块帧缓冲（见 main.c），
+# 所以颜色深度必须与面板一致，否则 flush 会写进格式不符的扫描缓冲。
+CONFIG_LV_COLOR_DEPTH_16=y
+# 不开 LV_USE_FREETYPE：LVGL 9.2 的 ESP 组件只声明 REQUIRES esp_timer，
+# 打开它会在拿不到 FreeType 头文件的情况下编译 lv_freetype.c；而让它读
+# 非文件字体所需的 LV_FREETYPE_USE_LVGL_PORT 又会重定义 FT_Stream_Open
+# 和 FreeType 的分配器，与 espressif/freetype 组件撞符号。
+# 本机已有 FreeType face 和 PSRAM 字形缓存（ttf_font.c），
+# mix_lv_font.c 把它包成 lv_font_t，全机只跑一份 FreeType。
+CONFIG_LV_USE_FREETYPE=n
+# 屏幕 400 PPI。LVGL 用 LV_DPI_DEF 换算内置组件的 dp 尺寸，留默认 130
+# 会让滚动条、下拉箭头这类内部尺寸按低密度屏计算，小到看不见。
+CONFIG_LV_DPI_DEF=400
+# 刷新周期对齐面板：PCLK 26MHz / (1144×803) ≈ 28Hz，约 35ms 一帧。
+# 比这更短只会让 LVGL 在同一帧里重复渲染。
+CONFIG_LV_DEF_REFR_PERIOD=33
 
 # ---- A/B OTA（USB CDC 协议内升级，不再需要 ROM 下载模式 + esptool）----
 # 新固件首次启动时处于 PENDING_VERIFY：mix_ota 在本地 UI/USB 健康后才
@@ -73,3 +93,16 @@ CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=n
 # 每次启动都校验待运行分区的镜像摘要，OTA 写坏可以在跳转前被发现。
 CONFIG_BOOTLOADER_APP_TEST=n
 CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT=n
+
+# ---- Autonomous failure recovery / bounded watchdog handoff ----
+CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
+CONFIG_ESP_SYSTEM_PANIC_PRINT_HALT=n
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_INIT=y
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=15
+# Keep RTC WDT through app startup; mix_health hands off only after subscribed
+# main, USB IO and OTA workers have actually progressed (no periodic RTC feed).
+CONFIG_BOOTLOADER_WDT_ENABLE=y
+CONFIG_BOOTLOADER_WDT_DISABLE_IN_USER_CODE=y
+CONFIG_BOOTLOADER_WDT_TIME_MS=30000

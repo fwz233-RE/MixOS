@@ -1,0 +1,74 @@
+[Unit]
+Description=MixOS translator backend (speech recognition, speech synthesis, model proxy)
+Documentation=file:///opt/mixos/docs/AI_DECK.md
+After=network.target mixos-litertlm.service
+Wants=mixos-litertlm.service
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/mixos-ai
+Environment=HOME=/home/pi
+# Speech models are staged onto the device; a lookup against a host this
+# network blocks costs a two-minute timeout inside a request handler.
+Environment=HF_HUB_OFFLINE=1
+Environment=TRANSFORMERS_OFFLINE=1
+# Loopback only. The upstream backend binds every interface, which on a
+# handheld that joins arbitrary Wi-Fi would publish speech recognition and a
+# proxy into the language model to whoever is on that network.
+ExecStart=/home/pi/mixos-ai/venv/bin/python /opt/mixos/linux/apps/translator/service.py --host 127.0.0.1 --port 3000
+Restart=on-failure
+RestartSec=5
+
+# No memory ceiling, deliberately.
+#
+# There was one here - MemoryMax=1200M with OOMPolicy=stop - and it was removed
+# on 2026-09-14 for two reasons, the second of which is the decision.
+#
+# It never did anything. This kernel boots with `cgroup_disable=memory`, so
+# /sys/fs/cgroup/cgroup.controllers offers `cpuset cpu io pids` and no `memory`,
+# /proc/cgroups has no `memory` row, and systemd reports
+# MemoryCurrent=[not set]. There was no memory.max file for the value to reach.
+#
+# And it is not wanted. Measured under load on 2026-09-14 - three complete
+# translations, sampled every second - the whole machine peaks at 2698 MiB of
+# 4049 with 1350 MiB still available, 131 MiB of zram touched, zero OOM kills and
+# zero restarts. This process is the larger half of that: 2107 MiB peak resident,
+# 1859 MiB of it anonymous, because onnxruntime parses the .ort files into its own
+# heap. A 1200 MiB ceiling described nothing real, and a ceiling set to the
+# measured figure would only convert a rare bad moment into a killed service. The
+# kernel is better placed to decide what to reclaim than a number written here
+# months earlier.
+#
+# Restart=on-failure above is what covers the remaining case: if the kernel's own
+# OOM killer ever does take this process, systemd brings it back rather than
+# leaving speech recognition absent until somebody notices.
+#
+# OOMPolicy has to be written explicitly, and `continue` is not a no-op here.
+# This system's built-in default is `stop` - `systemd-analyze cat-config
+# systemd/system.conf` shows `#DefaultOOMPolicy=stop`, and cron.service and
+# ssh.service both inherit it - and `stop` means systemd takes the whole service
+# down after an OOM kill and does *not* honour Restart=on-failure. That is the
+# one outcome worth avoiding: it turns a transient bad moment into speech
+# recognition being permanently absent until a person power-cycles the deck.
+OOMPolicy=continue
+#
+# See docs/AI_DECK.md "Memory budget" and .tools/probe_memory_under_load.py.
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/pi/mixos-ai /home/pi/.cache
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressAllow=localhost
+IPAddressDeny=any
+
+[Install]
+WantedBy=multi-user.target

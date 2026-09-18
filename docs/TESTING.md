@@ -75,6 +75,21 @@ node tests/test_preview.cjs
 `tests/test_ttf_render.py` 需要先构建 vendored FreeType 静态库，否则会跳过。
 构建方式见 `docs/ESP_FONT_BUILD.md`。
 
+## ESP32 A/B 更新离线测试
+
+以下命令只运行本地生产 C 代码测试桩、协议模拟与文件／服务模拟，不打开设备，不运行实际 systemd 服务：
+
+```powershell
+py -3.12 -m pytest tests/test_ota_firmware.py tests/test_ota_firmware_wire.py tests/test_link_update.py tests/test_mix_health.py -q
+py -3.12 -m pytest tests/test_ota_esp.py tests/test_ota_v2.py tests/test_mixos_esp_update.py tests/test_ota_supervisor.py tests/test_ota_bootstrap.py tests/test_deploy_ota.py tests/test_esp_release.py -q
+```
+
+`test_ota_firmware.py` 直接编译生产 `mix_ota.c` 与 `mix_ota_tx.c`，使用真实 SHA-256、地址／未定义行为检查，以及 SDK／NVS 故障注入。`test_ota_firmware_wire.py` 把 Python 生成的请求交给同一 C 状态机，验证字节级契约，而非仅让 Python 模型自洽。
+
+覆盖范围包括提交与日志失败、重复 END／REBOOT、试运行确认失败、无主机与本地故障区分、无事务日志的首次安装验证、受保护 A 槽、显式解除保护、A→B→A 模型及提交后迟到数据。Linux 测试覆盖独占锁、有限等待、不可变运行器、服务恢复、持久结果、只对账重试；首次安装测试核对允许写入区域、冗余启动记录、精确读回和独立 boot-only 授权。
+
+模拟 A→B→A 不代表设备上已经交替更新。完整交叉构建、实际 watchdog／回滚、实体 LCD、USB 重枚举、安装权限及断电行为仍需分别验证；设备阶段另行授权。
+
 ## ESP-IDF 工具链
 
 ESP32-S3 的构建环境由 `tools/idf_env.py` 单独描述——这是仓库里唯一一处记录

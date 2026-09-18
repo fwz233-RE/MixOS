@@ -84,16 +84,25 @@ def bash_command(argv: list[str], root: Path | None = None, cwd: str | None = No
     p = idf_paths(root)
     exports = " ".join(f"{k}={shlex.quote(v)}" for k, v in environment(root).items())
     directory = cwd if cwd is not None else p["project"]
+    # The PATH value must stay inside double quotes. Under WSL the inherited
+    # $PATH contains the Windows entries, including "Program Files (x86)";
+    # unquoted, `export` treats the expanded parenthesis as the start of an
+    # array assignment and the whole command dies with a syntax error. The
+    # shell_exports() path below always quoted it, which is why the shell
+    # script worked on this machine while this Python driver did not.
     return (f"export {exports} && "
-            f"export PATH={shlex.quote(path_prefix(root))}:$PATH && "
+            f'export PATH={shlex.quote(path_prefix(root))}:"$PATH" && '
             f"cd {shlex.quote(directory)} && "
             + " ".join(shlex.quote(a) for a in argv))
 
 
-def build_command(root: Path | None = None) -> str:
-    """The bash command that builds the ESP32-S3 application."""
+def build_command(root: Path | None = None, build_dir: Path | None = None) -> str:
+    """Build the application, optionally without replacing existing artifacts."""
     p = idf_paths(root)
-    return bash_command([p["python"], f"{p['idf_path']}/tools/idf.py", "build"], root)
+    argv = [p["python"], f"{p['idf_path']}/tools/idf.py"]
+    if build_dir is not None:
+        argv += ['-B', to_posix(build_dir)]
+    return bash_command([*argv, "build"], root)
 
 
 def describe() -> str:

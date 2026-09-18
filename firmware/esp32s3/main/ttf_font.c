@@ -19,6 +19,11 @@ static bool       s_ready;
 static bool       s_mapped;
 static esp_partition_mmap_handle_t s_map;
 static int        s_cur_size = -1;   // face 当前 FT_Set_Pixel_Sizes 的字号
+// The mapped partition itself. LVGL's FreeType binding opens fonts through
+// lv_fs rather than from memory, so mix_lv_font serves this same mapping as a
+// read-only file instead of mapping the partition a second time.
+static const void *s_data;
+static size_t      s_data_len;
 
 // ---------------------------------------------------------------------------
 // 字形缓存：开放寻址哈希表，key = codepoint<<8 | size（size ≤ 255）。
@@ -144,6 +149,8 @@ void ttf_font_deinit(void)
     if (s_mapped) esp_partition_munmap(s_map);
     s_mapped = false;
     s_map = 0;
+    s_data = NULL;
+    s_data_len = 0;
     s_cur_size = -1;
 }
 
@@ -196,6 +203,8 @@ esp_err_t ttf_font_init(void)
         goto fail;
     }
     s_ready = true;
+    s_data = ptr;
+    s_data_len = (size_t)part->size;
     ESP_LOGI(TAG, "TTF 就绪：%s %s，%ld 字形，分区 %lu KB @0x%lx",
              s_face->family_name ? s_face->family_name : "?",
              s_face->style_name ? s_face->style_name : "",
@@ -210,6 +219,41 @@ fail:
 bool ttf_font_ready(void)
 {
     return s_ready;
+}
+
+const void *ttf_font_data(size_t *len)
+{
+    if (len) *len = s_ready ? s_data_len : 0;
+    return s_ready ? s_data : NULL;
+}
+
+bool ttf_font_metrics(int size, ttf_metrics_t *out)
+{
+    if (!out || !set_size(size)) return false;
+    // Rounded up: a line box one pixel short clips descenders on every row.
+    out->ascent      = (int16_t)((s_face->size->metrics.ascender + 63) / 64);
+    out->descent     = (int16_t)((-s_face->size->metrics.descender + 63) / 64);
+    out->line_height = (int16_t)((s_face->size->metrics.height + 63) / 64);
+    if (out->line_height < out->ascent + out->descent)
+        out->line_height = (int16_t)(out->ascent + out->descent);
+    return true;
+}
+
+bool ttf_font_glyph(uint32_t codepoint, int size, ttf_glyph_t *out)
+{
+    if (!out) return false;
+    glyph_t *e = cache_get(codepoint, size);
+    if (!e) return false;
+    // A blank glyph (space) is a hit with no bitmap, not a miss: it still
+    // advances the pen, and reporting failure would make LVGL substitute a
+    // placeholder box for every space.
+    out->bitmap  = e->bmp;
+    out->w       = e->w;
+    out->h       = e->h;
+    out->left    = e->left;
+    out->top     = e->top;
+    out->advance = e->adv;
+    return true;
 }
 
 // RGB565 alpha 混合：dst = dst + (fg-dst)*a/255（逐通道）

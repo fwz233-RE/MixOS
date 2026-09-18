@@ -60,7 +60,7 @@ extern const uint8_t aw9523_snap_regs[AW9523_SNAP_COUNT];   // 快照覆盖的�
 // 返回 true = 快照有效（init 已跑且逐寄存器读取成功），值按 aw9523_snap_regs 顺序填入
 bool aw9523_boot_snapshot(uint8_t out[AW9523_SNAP_COUNT]);
 
-esp_err_t aw9523_init(i2c_master_bus_handle_t bus, i2c_master_dev_handle_t *out_dev);
+esp_err_t aw9523_init(i2c_master_dev_handle_t *out_dev);
 // 运行期自愈重建：芯片被 ESD/毛刺复位（寄存器回默认全输出高）后，按 aw9523_init
 // 同款绝对写入序列重建配置，并把 MUX 恢复到 mux_esp_side。
 // 与 init 的差异：INT_P0 保留 P0_7(VSYNC) 使能——调用时 vsync_mon 已在跑。

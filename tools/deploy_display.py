@@ -31,7 +31,31 @@ PREVIOUS_ESPTOOL_SHA256 = 'e3fb7d617498e4ebd6843f7c2e65dab862e048aa57a451f7924d9
 # is what the Pi-side worker expects to find in the backup before it writes
 # anything, so it is deliberately a pinned constant rather than "whatever the
 # last local build happened to produce".
-DEPLOYED_APP_SHA256 = 'b686000fdd2ab291f68edc3235e8c512e1937952c4f0b6850cbf7cbc014f5d71'
+#
+# 2026-09-13: refreshed after the value went stale. The 2026-09-12 recovery
+# flash replaced the application but left this constant on the build before it,
+# so the worker read a full 8 MiB backup, found the live app did not match, and
+# correctly refused to write. The current value is the application segment of
+# the readback whose full-image hash the device reproduced exactly during job
+# mixos-display-20260913-103821.
+#
+# 2026-09-15: stale again, for a new reason. Between 09-13 and 09-15 the device
+# was updated repeatedly over USB OTA, which is a separate tool that does not
+# maintain this constant, so it still described the 09-12 recovery flash. Two
+# guesses from the OTA receipts were both refused, because a receipt records
+# the image that was sent, and the device had since booted a different slot.
+# The way out was to take a backup and read the active slot named by otadata,
+# rather than trusting any deployment record; do that again when this goes
+# stale, instead of guessing.
+#
+# Now the icon-font update below has been written and read back byte-exact by
+# job mixos-display-20260915-131011, so this is that job's new application.
+# 2026-09-16: ROM recovery job mixos-display-20260916-024325 replaced ota_0.
+# Fresh backup and full readback were compared byte-for-byte locally as well:
+# build/deploy/recovery-20260916-024325-readback-verification.json. The bootloader,
+# table, otadata, preferences, font contents and ota_1 were unchanged. This hash
+# records programmed bytes; application boot is verified separately.
+DEPLOYED_APP_SHA256 = '7875d9a513acb95463b72e785ebd160c70d03f85e965c3a30a93d954bb4cff5f'
 
 
 def digest(path):
@@ -193,8 +217,23 @@ def main():
                 raise ValueError('Rebuild the font: current UI coverage/load manifest is required')
             files = {name: ROOT / name for name in [
                 'tools/flash_font_on_pi.py', 'tools/flash_esp_on_pi.py', 'tools/update_esp.py',
-                'tools/display_transport.py',
-                'linux/protocol.py', 'linux/mixosd.py', 'firmware/esp32s3/partitions.csv']}
+                'tools/display_transport.py', 'firmware/esp32s3/partitions.csv']}
+            # tools/update_esp.py imports linux/mixosd.py, which imports its own
+            # neighbours. protocol.py was staged and netctl.py was not, so on
+            # 2026-09-15 the job died at import in exactly the way the missing
+            # _mixlib had. Glob for the same reason given below: a module added
+            # next to mixosd.py must not silently break deployment again.
+            files.update({'linux/' + path.name: path
+                          for path in sorted((ROOT / 'linux').glob('*.py'))})
+            # Both flash workers import tools/_mixlib. Staging the callers
+            # without their own support package made the job die at import,
+            # after the launcher had already stopped mixosd. Globbing rather
+            # than listing the three modules keeps the package complete when a
+            # module is added to _mixlib.
+            mixlib = sorted((ROOT / 'tools/_mixlib').glob('*.py'))
+            if not any(path.name == '__init__.py' for path in mixlib):
+                raise ValueError('tools/_mixlib is missing its package __init__.py')
+            files.update({'tools/_mixlib/' + path.name: path for path in mixlib})
             files.update({'font.ttf': font, 'font-manifest.json': manifest, 'new-app.bin': app,
                           'firmware/esp32s3/build/mixos_esp32s3.bin': old_app, 'partition-table.bin': table,
                           'esptool.whl': ROOT / ESPTOOL_WHEEL})
@@ -287,10 +326,17 @@ def main():
                 'test ! -f ' + package + '/work/session/flash-audit.jsonl || tail -n 20 ' + package + '/work/session/flash-audit.jsonl', sudo=True)
             return
         required = {'tools/flash_font_on_pi.py', 'tools/flash_esp_on_pi.py', 'tools/update_esp.py',
-                    'linux/protocol.py', 'linux/mixosd.py', 'firmware/esp32s3/partitions.csv',
+                    'firmware/esp32s3/partitions.csv',
                     'font.ttf', 'font-manifest.json', 'new-app.bin',
                     'firmware/esp32s3/build/mixos_esp32s3.bin', 'partition-table.bin', 'esptool.whl', 'launch.sh'}
         required.add('tools/display_transport.py')
+        # Mirror the staging side for the daemon's own package too.
+        required.update('linux/' + path.name for path in sorted((ROOT / 'linux').glob('*.py')))
+        # Mirror the staging side: the workers' support package travels with
+        # them, and the exact-set check below still pins which modules may be
+        # present rather than accepting anything under tools/_mixlib/.
+        required.update('tools/_mixlib/' + path.name
+                        for path in sorted((ROOT / 'tools/_mixlib').glob('*.py')))
         required.update(transport.PACKAGES)
         provenance = receipt.get('artifact_provenance') or {}
         if provenance.get('mode') != 'historical_artifact_recovery':

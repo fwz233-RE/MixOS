@@ -38,6 +38,10 @@ python tools/flash_esp_remote.py --native --host 192.168.1.22 --serial TD0720
 
 The expected ROM identity is `303a:1001`, normally `/dev/ttyACM0`, with ROM serial `70:04:1D:D8:54:14`. The running application identity is different (`303a:80c3`, serial `TD0720`); do not pass the running-app serial when the device is in ROM.
 
+Button entry selects the USB-Serial/JTAG peripheral, which is why the identity is `303a:1001`. That is correct for this procedure, which writes only whole `0x10000`-aligned images, and it is **wrong for the A/B migration**, whose `0x1000` partition table and `0x2000` otadata writes need the `0x800` block size that esptool uses only on USB-OTG (`303a:0009`). Never try to migrate a device from button-entered download mode; see `ESP_OTA.md`.
+
+An aborted flash leaves the esptool stub running on the chip. The next operation must start from a fresh ROM, so repeat this button sequence after any failed attempt rather than reconnecting to the stub. A new USB device number in the kernel log is the evidence that the chip really re-entered ROM.
+
 ## 3. Make a complete backup before writing
 
 Use a temporary CM5 directory and the pinned `esptool 5.4.0` package. The CM5 uses Debian's externally managed Python environment, so install the wheel with `--break-system-packages` only for this explicitly staged package. Invoke the installed command from a directory other than `/home/pi/.local/bin`; otherwise the launcher file `esptool.py` can shadow the Python package.

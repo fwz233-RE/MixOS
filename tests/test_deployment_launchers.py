@@ -17,6 +17,16 @@ sys.path.insert(0, str(TOOLS))
 keyboard = importlib.import_module('deploy_keyboard')
 display = importlib.import_module('deploy_display')
 
+# The flash workers import tools/_mixlib, so it is part of the display package.
+# Derived rather than listed, for the same reason the launcher derives it: a new
+# module in _mixlib must not silently drop out of the package.
+MIXLIB = ['tools/_mixlib/' + path.name for path in sorted((TOOLS / '_mixlib').glob('*.py'))]
+# tools/update_esp.py imports linux/mixosd.py, which imports its neighbours, so
+# the daemon's own package travels with the workers. Derived for the same
+# reason as MIXLIB: staging netctl.py only after it broke a deployment is the
+# failure this list exists to prevent.
+LINUX_MODULES = ['linux/' + path.name for path in sorted((TOOLS.parent / 'linux').glob('*.py'))]
+
 
 def remote_script(argv):
     words = shlex.split(argv[-1])
@@ -26,6 +36,39 @@ def remote_script(argv):
 
 
 class LauncherTests(unittest.TestCase):
+    def synthetic_build(self, root):
+        """Unit-test fixture only; never attest or refresh real build evidence.
+
+        The archived default build intentionally stays stale while a new
+        candidate is built elsewhere. Launcher unit tests must not require
+        overwriting that archive just to match today's source tree.
+        """
+        def put(name, data):
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data if isinstance(data, bytes) else data.encode())
+            return path
+        app = put('firmware/esp32s3/build/mixos_esp32s3.bin', b'SYNTHETIC TEST APP, NOT FLASHABLE')
+        old = put('build/esp32s3/current-device-app.bin', b'SYNTHETIC TEST RECOVERY')
+        ui = put('firmware/esp32s3/main/mix_ui.c', '/* synthetic launcher source */\n')
+        font = put('build/font/MiSans-Normal-gb2312.ttf', b'SYNTHETIC FONT, NOT DEPLOYABLE')
+        table = None
+        for name in ('firmware/esp32s3/partitions.csv',
+                     'firmware/esp32s3/build/partition_table/partition-table.bin'):
+            table = put(name, (TOOLS.parent / name).read_bytes())
+        report = {'status': 'cross-built', 'target': 'esp32s3',
+                  'app': {'sha256': display.digest(app)},
+                  'build_app': {'sha256': display.digest(app)},
+                  'sources': [{'path': str(ui), 'sha256': display.digest(ui)}],
+                  'fixture_only': True}
+        put('build/esp32s3/font-app-build.json', json.dumps(report))
+        put('build/font/MiSans-Normal-gb2312.ttf.manifest.json', json.dumps({
+            'status': 'verified', 'output_sha256': display.digest(font),
+            'ui_source_sha256': display.digest(ui), 'ui_coverage_missing': [],
+            'required_coverage_missing': [],
+            'load_verification': {'partition_padded_load': 'passed'}, 'fixture_only': True}))
+        return app, old, table
+
     def test_installer_is_valid_python_and_rejects_unsafe_paths(self):
         script = keyboard.package_installer('/home/pi/stage', '/opt/package/job', {'tools/worker.py': 'a' * 64}, display=True)
         compile(script, '<installer>', 'exec')
@@ -73,10 +116,10 @@ class LauncherTests(unittest.TestCase):
     def test_display_installs_root_owned_package_and_restart_cleanup(self):
         names = ['tools/flash_font_on_pi.py', 'tools/flash_esp_on_pi.py', 'tools/update_esp.py',
                  'tools/ota_esp.py',
-                 'linux/protocol.py', 'linux/mixosd.py', 'firmware/esp32s3/partitions.csv',
+                 'firmware/esp32s3/partitions.csv',
                  'font.ttf', 'font-manifest.json', 'new-app.bin',
                  'firmware/esp32s3/build/mixos_esp32s3.bin', 'partition-table.bin', 'launch.sh',
-                 'tools/display_transport.py', *display.transport.PACKAGES]
+                 'tools/display_transport.py', *MIXLIB, *LINUX_MODULES, *display.transport.PACKAGES]
         scripts = self.start(display, {n: 'a' * 64 for n in names}, 'mixos-display')
         self.assertEqual(len(scripts), 2)
         compile(shlex.split(scripts[0])[-1], '<installer>', 'exec')
@@ -90,10 +133,10 @@ class LauncherTests(unittest.TestCase):
     def test_display_resume_option_propagates_only_to_one_new_job(self):
         names = ['tools/flash_font_on_pi.py', 'tools/flash_esp_on_pi.py', 'tools/update_esp.py',
                  'tools/ota_esp.py',
-                 'linux/protocol.py', 'linux/mixosd.py', 'firmware/esp32s3/partitions.csv',
+                 'firmware/esp32s3/partitions.csv',
                  'font.ttf', 'font-manifest.json', 'new-app.bin',
                  'firmware/esp32s3/build/mixos_esp32s3.bin', 'partition-table.bin', 'launch.sh',
-                 'tools/display_transport.py', *display.transport.PACKAGES]
+                 'tools/display_transport.py', *MIXLIB, *LINUX_MODULES, *display.transport.PACKAGES]
         source = '/opt/mixos-display-packages/mixos-display-20260910-175627/work/session'
         scripts = self.start(display, {n: 'a' * 64 for n in names}, 'mixos-display',
                              ('--resume-no-write-source', source))
@@ -159,32 +202,38 @@ class LauncherTests(unittest.TestCase):
             run.assert_not_called()
 
     def test_current_build_matches_sources_and_rejects_mutation(self):
-        root = TOOLS.parent
-        app = root / 'firmware/esp32s3/build/mixos_esp32s3.bin'
-        old = root / 'build/esp32s3/current-device-app.bin'
-        result = display.current_build_check(app, old)
-        self.assertEqual(result['mode'], 'current_verified_build')
-        self.assertFalse(result['screen_confirmation_required'])
-        self.assertEqual(result['device_app_sha256'], display.DEPLOYED_APP_SHA256)
-        with mock.patch.object(display, 'source_digest_matches', return_value=False):
-            with self.assertRaises(ValueError):
-                display.current_build_check(app, old)
-        # The build report attests the new app only, so an arbitrary old app is
-        # refused even though the report itself is perfectly valid.
-        with self.assertRaises(ValueError):
-            display.current_build_check(app, root / 'build/esp32s3/previous-mixos_esp32s3.bin')
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app, old, _ = self.synthetic_build(root)
+            with mock.patch.object(display, 'ROOT', root), \
+                    mock.patch.object(display, 'DEPLOYED_APP_SHA256', display.digest(old)):
+                result = display.current_build_check(app, old)
+                self.assertEqual(result['mode'], 'current_verified_build')
+                self.assertFalse(result['screen_confirmation_required'])
+                self.assertEqual(result['device_app_sha256'], display.DEPLOYED_APP_SHA256)
+                with mock.patch.object(display, 'source_digest_matches', return_value=False):
+                    with self.assertRaises(ValueError):
+                        display.current_build_check(app, old)
+                arbitrary_old = root / 'other.bin'
+                arbitrary_old.write_bytes(b'unrelated historical app')
+                with self.assertRaisesRegex(ValueError, 'recorded deployed'):
+                    display.current_build_check(app, arbitrary_old)
+                # Real byte mutation must also fail without mocking the gate.
+                (root / 'firmware/esp32s3/main/mix_ui.c').write_text('changed after build')
+                with self.assertRaisesRegex(ValueError, 'source changed'):
+                    display.current_build_check(app, old)
 
     def test_migrate_requires_an_ab_build(self):
-        root = TOOLS.parent
-        app = root / 'firmware/esp32s3/build/mixos_esp32s3.bin'
-        old = root / 'build/esp32s3/current-device-app.bin'
-        table = app.parent / 'partition_table/partition-table.bin'
-        self.assertTrue(display.current_build_check(app, old, table, True)['migrate_to_ab'])
         with tempfile.TemporaryDirectory() as temp:
-            legacy = Path(temp) / 'legacy.bin'
-            legacy.write_bytes(b'\xff' * 0xc00)  # An empty table is not the A/B one.
-            with self.assertRaises(ValueError):
-                display.current_build_check(app, old, legacy, True)
+            root = Path(temp)
+            app, old, table = self.synthetic_build(root)
+            with mock.patch.object(display, 'ROOT', root), \
+                    mock.patch.object(display, 'DEPLOYED_APP_SHA256', display.digest(old)):
+                self.assertTrue(display.current_build_check(app, old, table, True)['migrate_to_ab'])
+                legacy = root / 'legacy.bin'
+                legacy.write_bytes(b'\xff' * 0xc00)
+                with self.assertRaises(ValueError):
+                    display.current_build_check(app, old, legacy, True)
 
     def test_historical_receipt_option_requires_stage(self):
         with mock.patch.object(sys, 'argv', [display.__file__, '--start', 'unused', '--stage-from-receipt', 'prior']), \
@@ -196,26 +245,24 @@ class LauncherTests(unittest.TestCase):
     def test_display_stage_generates_exact_old_new_hash_and_safe_launcher(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            paths = ['build/font/MiSans-Normal-gb2312.ttf', 'build/esp32s3/current-device-app.bin',
-                     'firmware/esp32s3/build/mixos_esp32s3.bin',
-                     'firmware/esp32s3/build/partition_table/partition-table.bin',
-                     'build/font/MiSans-Normal-gb2312.ttf.manifest.json',
-                     'build/esp32s3/font-app-build.json', 'tools/display_transport.py',
-                     'tools/flash_font_on_pi.py', 'tools/flash_esp_on_pi.py', 'tools/update_esp.py',
-                     'tools/ota_esp.py',
-                     'linux/protocol.py', 'linux/mixosd.py', 'firmware/esp32s3/partitions.csv']
+            app, old, _ = self.synthetic_build(root)
+            paths = ['tools/display_transport.py', 'tools/flash_font_on_pi.py',
+                     'tools/flash_esp_on_pi.py', 'tools/update_esp.py', 'tools/ota_esp.py']
             source = TOOLS.parent
-            report = json.loads((source / 'build/esp32s3/font-app-build.json').read_text())
-            paths.extend('firmware/esp32s3/main/' + row['path'].replace('\\', '/').rsplit('/', 1)[-1]
-                         for row in report['sources'])
             paths.extend(str(path.relative_to(source))
                          for path in display.transport.local_packages(source).values())
+            # The workers import tools/_mixlib, so staging copies it too.
+            paths.extend(str(path.relative_to(source)).replace('\\', '/')
+                         for path in sorted((source / 'tools/_mixlib').glob('*.py')))
+            # Same for the daemon package that update_esp.py imports.
+            paths.extend(str(path.relative_to(source)).replace('\\', '/')
+                         for path in sorted((source / 'linux').glob('*.py')))
             for name in set(paths):
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes((source / name).read_bytes())
-            old_hash = display.DEPLOYED_APP_SHA256
-            new_hash = display.digest(root / 'firmware/esp32s3/build/mixos_esp32s3.bin')
+            old_hash = display.digest(old)
+            new_hash = display.digest(app)
             launches = []
             def run(command, **kwargs):
                 if command[0] == 'scp':
@@ -229,6 +276,7 @@ class LauncherTests(unittest.TestCase):
                         self.assertIn('tools/display_transport.py', archive.namelist())
                 return subprocess.CompletedProcess(command, 0)
             with mock.patch.object(display, 'ROOT', root), \
+                    mock.patch.object(display, 'DEPLOYED_APP_SHA256', old_hash), \
                     mock.patch.dict(os.environ, {'MIXOS_SSH_PASSWORD': 'fake-test-only'}), \
                     mock.patch.object(sys, 'argv', [display.__file__, '--stage']), \
                     mock.patch.object(display.subprocess, 'run', side_effect=run):

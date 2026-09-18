@@ -123,11 +123,17 @@ def stage_docs(stage: Stage) -> None:
 
 
 def stage_lint(stage: Stage) -> None:
-    """Static checks that need no toolchain: valid UTF-8, parseable, no dead imports."""
+    """Static checks that need no toolchain: valid UTF-8, parseable, no dead imports.
+
+    Vendored third-party sources are excluded. They are byte-exact copies whose
+    digests are recorded in a PROVENANCE.json next to them; editing one to
+    satisfy our style would break the only thing that makes it verifiable.
+    """
     problems: list[str] = []
     files = []
     for folder in ("tools", "tests", "linux"):
-        files += sorted((ROOT / folder).rglob("*.py"))
+        files += [p for p in sorted((ROOT / folder).rglob("*.py"))
+                  if "vendor" not in p.relative_to(ROOT).parts]
 
     for path in files:
         raw = path.read_bytes()
@@ -143,7 +149,8 @@ def stage_lint(stage: Stage) -> None:
         stage.status = "unavailable" if not problems else "fail"
         stage.detail = "\n".join(problems) or "pyflakes not installed (pip install pyflakes)"
         return
-    problems += [line for line in result.stdout.splitlines() if line.strip()]
+    problems += [line for line in result.stdout.splitlines()
+                 if line.strip() and "vendor" not in line.split(":", 1)[0].replace("\\", "/").split("/")]
 
     stage.status = "pass" if not problems else "fail"
     stage.detail = (f"{len(files)} Python files checked"

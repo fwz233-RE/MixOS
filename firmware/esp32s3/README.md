@@ -8,10 +8,10 @@ running on the on-board ESP32-S3-PICO-1.
 
 - **USB UAC audio**: full-speed USB sound card (48 kHz, ES8389 codec,
   speaker / headphone with HP detect, dual microphones)
-- **USB CDC console**: debug commands and remote maintenance
-  (`EGGFLY_REBOOT_TO_BOOT_MODE` reboot-to-download magic string,
-  `EGGFLY_SCREENSHOT` framebuffer dump, `EGGFLY_AW_DUMP` IO-expander
-  forensics, theme / tab / screen-toggle commands)
+- **USB CDC console**: debug commands and remote maintenance. The former
+  `EGGFLY_*` magic strings are gone; maintenance now travels as framed
+  messages on the protocol's maintenance channel. A framebuffer dump is
+  available there (`MIX_SCREEN_REQUEST`); see `tools/esp_screenshot.py`.
 - **LCD GUI**: 1024x768 RGB (DPI) panel dashboard with four themes,
   Chinese/English UI (FreeType + font partition), battery / power monitoring
 - **Touch**: GT911 reset handling behind the CM/ESP display MUX

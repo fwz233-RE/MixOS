@@ -8,7 +8,7 @@ import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'linux'))
 from protocol import (Frame, Decoder, ReceiveEpoch, Credit, cobs_encode,
-                      cobs_decode, decode, newer, MAX_ENCODED)
+                      cobs_decode, decode, newer, MAX_ENCODED, MAX_CHANNEL)
 
 # Shared deterministic vectors for the portable C codec. Wire includes delimiter.
 GOLDEN_HELLO = '02010201057856341201010102010101020401020206103b55d14a00'
@@ -59,12 +59,22 @@ class ProtocolTests(unittest.TestCase):
         bad_crc[-1] ^= 1
         with self.assertRaises(ValueError):
             decode(cobs_encode(bad_crc))
-        for offset, value in [(0, 2), (1, 6), (3, 1), (16, 255), (17, 3)]:
+        # Offset 1 is the channel: NET=6 is the highest defined one, so 7 is
+        # the first value that must still be rejected.
+        for offset, value in [(0, 2), (1, 7), (3, 1), (16, 255), (17, 3)]:
             raw = original.copy()
             raw[offset] = value
             raw[-4:] = struct.pack('<I', zlib.crc32(raw[:-4]))
             with self.assertRaises(ValueError):
                 decode(cobs_encode(raw))
+        # Every defined channel decodes; the bound moved, it did not vanish.
+        for channel in range(0, MAX_CHANNEL + 1):
+            raw = original.copy()
+            raw[1] = channel
+            raw[-4:] = struct.pack('<I', zlib.crc32(raw[:-4]))
+            self.assertEqual(decode(cobs_encode(raw)).channel, channel)
+        with self.assertRaises(ValueError):
+            Frame(MAX_CHANNEL + 1, 18, 1).encode()
         with self.assertRaises(ValueError):
             Frame(1, 18, 1, payload=b'x' * 513).encode()
 

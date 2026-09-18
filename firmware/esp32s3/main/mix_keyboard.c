@@ -1,9 +1,13 @@
 #include "mix_keyboard.h"
 #include <string.h>
+#include "board_pins.h"
+#include "mix_i2c.h"
 // Wire constants intentionally local: ESP build has no QMK dependency.
 #define FRAME_SIZE 126
 #define HEADER_SIZE 28
 #define BATCH_SIZE 32
+// The slave answers from a prepared buffer, so a healthy read never needs
+// longer than this; a longer wait would stall the UI task behind a dead MCU.
 #define IO_TIMEOUT_MS 5
 #define POLL_MS 20
 #define OFFLINE_MS 1000
@@ -26,7 +30,7 @@ static uint16_t crc16(const uint8_t *data, size_t len) {
     return crc;
 }
 static bool real(uint8_t r, uint8_t c) { return r < 6 && c < 11 && (r != 0 || ((0x038eU >> c) & 1U)); }
-static esp_err_t write_bytes(const uint8_t *p, size_t n) { return i2c_master_transmit(device, p, n, IO_TIMEOUT_MS); }
+static esp_err_t write_bytes(const uint8_t *p, size_t n) { return mix_i2c_transmit(device, p, n, IO_TIMEOUT_MS); }
 void mix_keyboard_reset_input(void) {
     waiting_release = true;
     mix_input_reset();
@@ -38,11 +42,11 @@ static void failed(uint32_t now) {
     mix_keyboard_reset_input();
     next_poll = now + OFFLINE_MS;
 }
-esp_err_t mix_keyboard_init(i2c_master_bus_handle_t bus, mix_key_cb cb, void *ctx) {
-    if (!bus) return ESP_ERR_INVALID_ARG;
+esp_err_t mix_keyboard_init(mix_key_cb cb, void *ctx) {
+    // The bus belongs to mix_i2c; main.c initialises it before any driver runs.
     // Idempotent re-init without leaking another IDF device handle.
     if (device) {
-        esp_err_t e = i2c_master_bus_rm_device(device);
+        esp_err_t e = mix_i2c_rm_device(device);
         if (e != ESP_OK) return e;
         device = NULL;
     }
@@ -51,12 +55,8 @@ esp_err_t mix_keyboard_init(i2c_master_bus_handle_t bus, mix_key_cb cb, void *ct
     remote_overflow = overflows = 0; backlight_steps = 0;
     memset(rows, 0, sizeof(rows));
     mix_input_init(cb, ctx); mix_keyboard_reset_input();
-    i2c_device_config_t cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = 0x1f,
-        .scl_speed_hz = 400000,
-    };
-    return i2c_master_bus_add_device(bus, &cfg, &device);
+    device = mix_i2c_add_device(MIX_KEYBOARD_I2C_ADDR, I2C_FAST_HZ);
+    return device ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 bool mix_keyboard_online(void) { return online; }
 uint32_t mix_keyboard_overflows(void) { return overflows; }
@@ -67,8 +67,8 @@ void mix_keyboard_backlight_step(void) {
 void mix_keyboard_tick(uint32_t now) {
     if (!device || (scheduled && (int32_t)(now - next_poll) < 0)) return;
     scheduled = true; next_poll = now + POLL_MS;
-    uint8_t frame[FRAME_SIZE], reg = 0;
-    if (i2c_master_transmit_receive(device, &reg, 1, frame, sizeof(frame), IO_TIMEOUT_MS) != ESP_OK) { failed(now); return; }
+    uint8_t frame[FRAME_SIZE];
+    if (mix_i2c_read(device, 0, frame, sizeof(frame), IO_TIMEOUT_MS) != ESP_OK) { failed(now); return; }
     if (u16(frame + FRAME_SIZE - 2) != crc16(frame, FRAME_SIZE - 2)) { failed(now); return; }
     if (frame[0] != 0x6b || frame[1] != 1 || (frame[2] & ~1U) || frame[3] > 128 || frame[22] > 8 || frame[23]) { failed(now); return; }
     uint16_t snapshot[6];

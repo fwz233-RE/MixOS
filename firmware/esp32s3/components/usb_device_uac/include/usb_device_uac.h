@@ -46,6 +46,17 @@ typedef struct  {
  */
 esp_err_t uac_device_init(uac_device_config_t *config);
 
+/**
+ * @brief One-shot physical USB detach immediately before a software restart.
+ *
+ * Task context only, after this component has initialized its own TinyUSB
+ * controller. Synchronous and bounded: no stack queue, endpoint flush, deinit
+ * or task deletion. Returns false when this component did not initialize USB.
+ * The caller must keep the device detached for a host-visible interval and
+ * then restart; ordinary USB operation must not be resumed after this call.
+ */
+bool uac_device_disconnect_for_restart(void);
+
 #ifdef __cplusplus
 }
 #endif

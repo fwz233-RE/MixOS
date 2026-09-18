@@ -8,20 +8,36 @@ struct test_queue { mix_frame_t frames[16]; unsigned count, capacity; };
 static struct test_queue queues[3];
 static unsigned allocated;
 QueueHandle_t xQueueCreate(unsigned n,size_t size){assert(allocated<3&&n<=16&&size==sizeof(mix_frame_t));QueueHandle_t q=&queues[allocated++];q->capacity=n;return q;}
+#ifndef MIX_LINK_IO_TEST
 int xQueueSend(QueueHandle_t q,const void *p,unsigned wait){(void)wait;if(q->count==q->capacity)return 0;q->frames[q->count++]=*(const mix_frame_t*)p;return pdTRUE;}
 int xQueueReceive(QueueHandle_t q,void *p,unsigned wait){(void)wait;if(!q->count)return 0;*(mix_frame_t*)p=q->frames[0];memmove(q->frames,q->frames+1,--q->count*sizeof(mix_frame_t));return pdTRUE;}
+#endif
 void xQueueReset(QueueHandle_t q){q->count=0;}
+unsigned uxQueueSpacesAvailable(QueueHandle_t q){return q->capacity-q->count;}
+int64_t esp_timer_get_time(void){return (int64_t)now*1000;}
+esp_err_t mix_watchdog_task_begin(mix_health_task_t r){(void)r;return ESP_OK;}
+esp_err_t mix_watchdog_task_reset(mix_health_task_t r){(void)r;return ESP_OK;}
+esp_err_t mix_watchdog_task_end(mix_health_task_t r){(void)r;return ESP_OK;}
+void vTaskDelete(void *p){(void)p;}
+const uint16_t *mix_ui_framebuffer(size_t *bytes,uint16_t *w,uint16_t *h){if(bytes)*bytes=0;if(w)*w=0;if(h)*h=0;return NULL;}
+#ifndef MIX_LINK_IO_TEST
 void vTaskDelay(unsigned n){(void)n;}
+#endif
 int xTaskCreate(void (*fn)(void*),const char *name,unsigned stack,void *arg,unsigned priority,void *handle){(void)fn;(void)name;(void)stack;(void)arg;(void)priority;(void)handle;return pdPASS;}
 uint32_t esp_random(void){static uint32_t n=100;return ++n;}
+#ifndef MIX_LINK_IO_TEST
 bool tud_cdc_connected(void){return false;}
 bool tud_mounted(void){return false;}
 uint32_t tud_cdc_read(void *p,uint32_t n){(void)p;(void)n;return 0;}
 uint32_t tud_cdc_write(const void *p,uint32_t n){(void)p;return n;}
 void tud_cdc_write_flush(void){}
+#endif
 cJSON *cJSON_ParseWithLength(const char *p,size_t n){(void)p;(void)n;return NULL;}
 cJSON *cJSON_GetObjectItemCaseSensitive(cJSON *j,const char *key){(void)j;(void)key;return NULL;}
 int cJSON_IsNumber(const cJSON *j){(void)j;return 0;}
+int cJSON_IsString(const cJSON *j){(void)j;return 0;}
+int cJSON_IsObject(const cJSON *j){(void)j;return 0;}
+int cJSON_IsTrue(const cJSON *j){(void)j;return 0;}
 void cJSON_Delete(cJSON *j){(void)j;}
 
 /* A model of mix_ota.c: the slot, the in-order write rule and the refusal
@@ -69,7 +85,53 @@ uint32_t mix_ota_total(void){return ota_total;}
 int mix_ota_percent(void){return ota_total?(int)((uint64_t)ota_got*100/ota_total):0;}
 const char *mix_ota_running_slot(void){return "ota_0";}
 const char *mix_ota_target_slot(void){return "ota_1";}
+/* The link only has to carry this through untouched and answer at any time;
+ * the real descriptor lives in the image header. `ota_identity_ok` is the
+ * device that cannot produce one, which must become an ERROR rather than a
+ * silent non-answer the host would read as a rollback. */
+static bool ota_identity_ok;
+size_t mix_ota_identity(uint8_t *out,size_t cap){
+    if(!ota_identity_ok||!out||cap<MIX_OTA_IDENTITY_BYTES)return 0;
+    memset(out,0,MIX_OTA_IDENTITY_BYTES);
+    out[0]=1;out[1]=1;out[2]=1;out[3]=12;mix_put32(out+4,0x610000);
+    memset(out+8,0xA5,32);
+    memcpy(out+40,"Sep 14 2026",11);
+    memcpy(out+56,"20:42:03",8);
+    return MIX_OTA_IDENTITY_BYTES;
+}
 const char *mix_ota_error(void){return ota_reason[0]?ota_reason:"update failed for an unrecorded reason";}
+/* Link tests use an immediately serviced worker adapter. Real async owner,
+ * hashing, journal and failures run separately in test_ota_firmware.py. */
+static bool worker_restart;
+static mix_ota_reply_t worker_reply_items[32];
+static unsigned worker_reply_count;
+static uint32_t model_generation=1;
+static void model_reply(uint32_t sid,uint8_t type,const void *p,size_t n){
+    assert(worker_reply_count<32);mix_ota_reply_t *r=&worker_reply_items[worker_reply_count++];
+    memset(r,0,sizeof(*r));r->generation=model_generation;r->session=sid;r->type=type;r->length=(uint16_t)n;if(n)memcpy(r->payload,p,n);
+}
+esp_err_t mix_ota_init_worker(void){return ESP_OK;}
+bool mix_ota_submit_legacy(uint8_t type,uint32_t sid,const uint8_t *p,size_t n){
+    uint8_t b[12];esp_err_t e=ESP_OK;
+    if(type==MIX_OTA_BEGIN){
+        if(n!=36)return false;
+        e=mix_ota_begin(mix_get32(p),p+4);
+        if(e==ESP_OK){mix_put32(b,MIX_OTA_CHUNK);mix_put32(b+4,MIX_OTA_WINDOW);mix_put32(b+8,mix_get32(p));model_reply(sid,MIX_OTA_READY,b,12);}
+    }else if(type==MIX_OTA_DATA){
+        if(n<5)return false;e=mix_ota_write(mix_get32(p),p+4,n-4);
+        if(e==ESP_OK||e==ESP_ERR_INVALID_STATE){mix_put32(b,ota_got);model_reply(sid,MIX_OTA_ACK,b,4);e=ESP_OK;ota_acked=ota_got;}
+    }else if(type==MIX_OTA_STATUS){mix_put32(b,ota_got);model_reply(sid,MIX_OTA_ACK,b,4);
+    }else if(type==MIX_OTA_END){e=mix_ota_finish();if(e==ESP_OK){mix_put32(b,ota_total);model_reply(sid,MIX_OTA_DONE,b,4);restart_at=now+1200;worker_restart=true;ota_session=0;}
+    }else if(type==MIX_OTA_ABORT){mix_ota_abort();mix_ota_reset();ota_session=0;}
+    if(e!=ESP_OK)model_reply(sid,MIX_ERROR,mix_ota_error(),strlen(mix_ota_error()));
+    return true;
+}
+bool mix_ota_submit_request(uint32_t sid,const uint8_t*p,size_t n){(void)sid;(void)p;(void)n;return false;}
+bool mix_ota_poll_reply(mix_ota_reply_t*r){while(worker_reply_count){*r=worker_reply_items[0];memmove(worker_reply_items,worker_reply_items+1,--worker_reply_count*sizeof(*r));if(r->generation==model_generation)return true;}return false;}
+size_t mix_ota_capabilities(uint8_t*p,size_t n){(void)p;(void)n;return 0;}
+void mix_ota_link_lost(void){model_generation++;mix_ota_abort();mix_ota_reset();}
+bool mix_ota_transaction_busy(void){return ota_state==MIX_OTA_RECEIVING||ota_state==MIX_OTA_READY_TO_BOOT;}
+bool mix_ota_take_worker_restart(void){if(worker_restart&&restart_at&&(int32_t)(now-restart_at)>=0){worker_restart=false;return true;}return false;}
 
 static mix_view_t view;
 static uint32_t seq;
@@ -92,17 +154,26 @@ static void ota_begin_frame(uint32_t sid,uint32_t size){
 static void ota_data_frame(uint32_t sid,uint32_t offset,unsigned len){
     uint8_t p[4+MIX_OTA_CHUNK]={0};mix_put32(p,offset);queue_payload(MIX_OTA_DATA,sid,p,4+len);
 }
+/* The host's answer to OPEN, echoing the geometry that was asked for. A
+ * mismatch is a different case on purpose, so this has to be exact. */
+static void opened(uint32_t sid){
+    mix_frame_t f={.channel=MIX_CH_TERMINAL,.type=MIX_OPENED,.session=sid,.length=4,
+                   .epoch=epoch,.sequence=++seq};
+    mix_put16(f.payload,req_cols);mix_put16(f.payload+2,req_rows);
+    assert(xQueueSend(rxq,&f,0)==pdTRUE);mix_link_tick(now,&view);
+}
 static bool saw(unsigned type,uint32_t sid,mix_frame_t *out){
-    for(unsigned i=0;i<controlq->count;i++)
+    for(unsigned left=controlq->count;left;left--){unsigned i=left-1;
         if(controlq->frames[i].type==type&&controlq->frames[i].session==sid){
             if(out)*out=controlq->frames[i];return true;
         }
+    }
     return false;
 }
-static void reset_ota_model(void){ota_state=MIX_OTA_IDLE;ota_total=ota_got=0;ota_slot=0x1F0000;ota_trial=false;ota_was_reset=false;ota_reason[0]=0;}
+static void reset_ota_model(void){ota_state=MIX_OTA_IDLE;ota_total=ota_got=0;ota_slot=0x1F0000;ota_trial=false;ota_was_reset=false;ota_identity_ok=true;ota_reason[0]=0;}
 static void setup(void){
     allocated=0;memset(queues,0,sizeof(queues));assert(mix_link_init()==ESP_OK);
-    reset_ota_model();
+    reset_ota_model();worker_reply_count=0;worker_restart=false;
     /* A staged reboot outlives restart_link() on real hardware, which is the
      * point of it. Each case here is a fresh device, so clear it explicitly
      * rather than letting one subtest's pending reboot refuse the next
@@ -124,7 +195,7 @@ int main(int argc,char **argv){
     assert(argc==2);setup();
     if(!strcmp(argv[1],"automatic")){
         /* Readiness and ENTER_BOOT succeed with zero UI input. */
-        ready(55);assert(!mix_link_open_terminal());send(MIX_ENTER_BOOT,55);
+        ready(55);assert(!mix_link_open_app(MIX_APP_SHELL));send(MIX_ENTER_BOOT,55);
         assert(mix_link_take_boot_request());no_boot();assert(!pending_update&&!update_grant);
         setup();session=9;terminal_open=true;send(MIX_PREPARE_UPDATE,56);
         assert(!terminal_open&&!session&&update_grant==56);
@@ -168,6 +239,44 @@ int main(int argc,char **argv){
         setup();ready(55);mix_link_tick(now+8001,&view);assert(!update_grant&&!online);no_boot();
     }else if(!strcmp(argv[1],"queue")){
         controlq->count=controlq->capacity;send(MIX_PREPARE_UPDATE,55);assert(io_fault&&!update_grant&&!pending_update);send(MIX_ENTER_BOOT,55);no_boot();
+    }else if(!strcmp(argv[1],"switch")){
+        /* Opening an application while a different one holds the session has to
+         * end the old one first. Returning true and sending nothing - which is
+         * what this did - left the host running the notes editor while the
+         * screen titled itself "live translation". */
+        mix_frame_t f;
+        assert(mix_link_open_app(MIX_APP_NOTES));
+        assert(opening&&open_app==MIX_APP_NOTES);
+        uint32_t first=session;
+        opened(first);
+        assert(terminal_open&&!opening&&view.running_app==MIX_APP_NOTES);
+        xQueueReset(controlq);
+        assert(mix_link_open_app(MIX_APP_TRANSLATE));
+        /* CLOSE for the old session, then OPEN for a new one, in that order and
+         * on the same channel, so the host has torn the old pseudo-terminal
+         * down by the time it reads the request for the new one. */
+        assert(controlq->count==2);
+        assert(controlq->frames[0].type==MIX_CLOSE&&controlq->frames[0].session==first);
+        assert(controlq->frames[1].type==MIX_OPEN&&controlq->frames[1].session==session);
+        assert(session!=first&&opening&&!terminal_open&&open_app==MIX_APP_TRANSLATE);
+        f=controlq->frames[1];
+        assert(f.length==5+9&&f.payload[4]==9&&!memcmp(f.payload+5,"translate",9));
+        opened(session);
+        assert(terminal_open&&view.running_app==MIX_APP_TRANSLATE);
+
+        /* Asking for the application already on screen changes nothing: the
+         * half-written note survives pressing its own card twice. */
+        uint32_t held=session;xQueueReset(controlq);
+        assert(mix_link_open_app(MIX_APP_TRANSLATE));
+        assert(!controlq->count&&session==held&&terminal_open&&!opening);
+
+        /* The same rule while the first OPEN is still unanswered. */
+        setup();assert(mix_link_open_app(MIX_APP_NOTES));
+        first=session;xQueueReset(controlq);
+        assert(mix_link_open_app(MIX_APP_SHELL));
+        assert(controlq->count==2&&controlq->frames[0].type==MIX_CLOSE);
+        assert(controlq->frames[0].session==first&&controlq->frames[1].session==session);
+        assert(open_app==MIX_APP_SHELL&&session!=first);
     }else if(!strcmp(argv[1],"ota")){
         /* A whole transfer, including the acknowledgement the tick owes the host. */
         mix_frame_t f;
@@ -208,22 +317,70 @@ int main(int argc,char **argv){
         /* A failure is reported once, then the view stops advertising it. */
         setup();ota_begin_frame(73,2*MIX_OTA_CHUNK);xQueueReset(controlq);
         ota_state=MIX_OTA_FAILED;snprintf(ota_reason,sizeof(ota_reason),"sha256 mismatch");
+        model_reply(73,MIX_ERROR,ota_reason,strlen(ota_reason));
         tick(now+5);
         assert(saw(MIX_ERROR,73,&f)&&f.length==15&&!memcmp(f.payload,"sha256 mismatch",15));
-        assert(!ota_session&&ota_was_reset&&view.ota_state==MIX_OTA_IDLE&&!view.maintenance_busy);
+        /* Failure evidence is retained until a new validated BEGIN. */
+        assert(!ota_session&&view.ota_state==MIX_OTA_FAILED&&!view.maintenance_busy);
 
         /* A transfer owns the link: terminal and job requests wait. */
         setup();ota_begin_frame(74,2*MIX_OTA_CHUNK);
-        assert(!mix_link_open_terminal()&&!mix_link_input((const uint8_t*)"x",1));
+        assert(!mix_link_open_app(MIX_APP_SHELL)&&!mix_link_input((const uint8_t*)"x",1));
         mix_link_job(true);assert(!job_running);
         assert(view.maintenance_busy);
         send(MIX_OTA_ABORT,74);assert(!ota_session&&ota_state==MIX_OTA_IDLE);
-        xQueueReset(controlq);assert(mix_link_open_terminal());
+        xQueueReset(controlq);assert(mix_link_open_app(MIX_APP_TRANSLATE));
 
         /* A disconnect abandons the transfer without stranding the state. */
         setup();ota_begin_frame(75,2*MIX_OTA_CHUNK);
         transport_open=false;mix_link_tick(now,&view);
         assert(!ota_session&&ota_state==MIX_OTA_IDLE&&!view.maintenance_busy);
+    }else if(!strcmp(argv[1],"identify")){
+        /* The question the host asks after the post-update reboot: which build
+         * is actually running? It has to be answerable on a link that was just
+         * re-established, with no transfer in progress and in a session the
+         * device has never seen - that is the entire point of it, because a
+         * rolled-back build completes the handshake exactly like the new one. */
+        mix_frame_t f;
+        send(MIX_OTA_IDENTIFY,90);
+        assert(saw(MIX_OTA_IDENTITY,90,&f)&&f.length==MIX_OTA_IDENTITY_BYTES);
+        assert(f.channel==MIX_CH_MAINTENANCE&&f.epoch==epoch);
+        assert(f.payload[0]==1&&f.payload[1]==1&&f.payload[2]==1&&f.payload[3]==12);
+        assert(mix_get32(f.payload+4)==0x610000);
+        assert(!memcmp(f.payload+40,"Sep 14 2026",12));
+        assert(!memcmp(f.payload+56,"20:42:03",9));
+        /* Answering leaves no state behind: it is a question, not a transfer. */
+        assert(!ota_session&&ota_state==MIX_OTA_IDLE&&!view.maintenance_busy);
+
+        /* Asking again in yet another session is still answered. A host that
+         * retries after a re-enumeration must not be told to go away. */
+        xQueueReset(controlq);send(MIX_OTA_IDENTIFY,91);
+        assert(saw(MIX_OTA_IDENTITY,91,&f)&&f.length==MIX_OTA_IDENTITY_BYTES);
+
+        /* Also answerable mid-transfer, and without disturbing it. */
+        setup();ota_begin_frame(92,4*MIX_OTA_CHUNK);
+        ota_data_frame(92,0,MIX_OTA_CHUNK);tick(now+5);
+        xQueueReset(controlq);send(MIX_OTA_IDENTIFY,92);
+        assert(saw(MIX_OTA_IDENTITY,92,&f)&&f.length==MIX_OTA_IDENTITY_BYTES);
+        assert(ota_session==92&&ota_state==MIX_OTA_RECEIVING&&ota_got==MIX_OTA_CHUNK);
+
+        /* Malformed or unaddressed requests are ignored, exactly like every
+         * other maintenance frame. */
+        setup();
+        frame(MIX_CH_MAINTENANCE,MIX_OTA_IDENTIFY,93,1,epoch,++seq);
+        assert(!saw(MIX_OTA_IDENTITY,93,NULL));
+        send(MIX_OTA_IDENTIFY,0);assert(!controlq->count);
+        frame(MIX_CH_MAINTENANCE,MIX_OTA_IDENTIFY,94,0,epoch+1,++seq);
+        assert(!saw(MIX_OTA_IDENTITY,94,NULL));
+        frame(MIX_CH_JOB,MIX_OTA_IDENTIFY,95,0,epoch,++seq);
+        assert(!saw(MIX_OTA_IDENTITY,95,NULL));
+
+        /* A device that cannot describe itself says so. Silence here would be
+         * read by the host as "rolled back to a build that predates the
+         * check", which is a different fault with a different remedy. */
+        setup();ota_identity_ok=false;send(MIX_OTA_IDENTIFY,96);
+        assert(!saw(MIX_OTA_IDENTITY,96,NULL));
+        assert(saw(MIX_ERROR,96,&f)&&f.length==20&&!memcmp(f.payload,"identity unavailable",20));
     }else{
         fprintf(stderr,"unknown scenario: %s\n",argv[1]);return 2;
     }

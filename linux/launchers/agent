@@ -1,0 +1,28 @@
+#!/bin/sh
+# MixOS application launcher: the Agent button, which does nothing yet.
+#
+# The screen already knows this: mix_ui.c draws a placeholder for the Agent
+# card and deliberately does not send an OPEN frame for it. This file exists so
+# that the host's allow-list is not a promise it cannot keep — if anything ever
+# does ask for `agent`, the answer is a screen that says the feature is not
+# built yet, rather than mixosd reporting that a program is missing.
+set -eu
+
+restore=''
+if command -v stty >/dev/null 2>&1; then
+    restore="$(stty -g 2>/dev/null || true)"
+    stty raw -echo 2>/dev/null || true
+fi
+
+# Alternate screen, so whatever was here before comes back on the way out.
+printf '\033[?1049h\033[2J\033[H'
+printf '\033[1m  Agent\033[0m\r\n\r\n'
+printf '  这个按钮还没有接上任何东西。\r\n'
+printf '  Nothing is wired to this button yet.\r\n\r\n'
+printf '\033[2m  按任意键返回 / press any key to go back\033[0m\r\n'
+
+dd bs=1 count=1 >/dev/null 2>&1 || true
+
+printf '\033[?1049l'
+[ -n "$restore" ] && stty "$restore" 2>/dev/null || true
+exit 0

@@ -19,6 +19,10 @@ class Channel(IntEnum):
     JOB = 3
     MAINTENANCE = 4
     LOG = 5
+    NET = 6
+
+
+MAX_CHANNEL = int(Channel.NET)
 
 
 class Type(IntEnum):
@@ -52,7 +56,22 @@ class Type(IntEnum):
     OTA_DONE = 72
     OTA_ABORT = 73
     OTA_STATUS = 74
+    OTA_IDENTIFY = 75
+    OTA_IDENTITY = 76
+    CAPS_QUERY = 77
+    CAPS = 78
+    OTA_REQUEST = 79
     LOG = 80
+    OTA_RESPONSE = 81
+    SCREEN_REQUEST = 88
+    SCREEN_INFO = 89
+    SCREEN_DATA = 90
+    SCREEN_END = 91
+    NET_SCAN = 96
+    NET_LIST = 97
+    NET_CONNECT = 98
+    NET_FORGET = 99
+    NET_RESULT = 100
 
 
 def newer(value, previous):
@@ -108,7 +127,7 @@ class Frame:
     payload: bytes = b''
 
     def encode(self):
-        if not 0 <= self.channel <= 5 or len(self.payload) > MAX_PAYLOAD:
+        if not 0 <= self.channel <= MAX_CHANNEL or len(self.payload) > MAX_PAYLOAD:
             raise ValueError('invalid channel or payload length')
         header = HEADER.pack(1, self.channel, self.type, 0, self.epoch,
                              self.session, self.sequence, len(self.payload))
@@ -123,7 +142,7 @@ def decode(encoded):
     if not 22 <= len(raw) <= MAX_DECODED:
         raise ValueError('invalid frame length')
     version, channel, kind, flags, epoch, session, sequence, length = HEADER.unpack_from(raw)
-    if version != 1 or flags or channel > 5 or length > MAX_PAYLOAD or len(raw) != 22 + length:
+    if version != 1 or flags or channel > MAX_CHANNEL or length > MAX_PAYLOAD or len(raw) != 22 + length:
         raise ValueError('invalid header')
     if zlib.crc32(raw[:-4]) != struct.unpack_from('<I', raw, len(raw) - 4)[0]:
         raise ValueError('CRC mismatch')

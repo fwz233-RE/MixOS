@@ -3,6 +3,11 @@
 #include "mix_protocol.h"
 #include "mix_terminal.h"
 #include "mix_ota.h"
+#include "mix_ota_tx.h"
+#include "esp_timer.h"
+#include "mix_health.h"
+#include <stdatomic.h>
+#include "mix_ui.h"
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
@@ -14,95 +19,321 @@
 #include "tusb.h"
 
 static QueueHandle_t rxq,controlq,inputq;
-static volatile uint32_t io_epoch;
-static volatile bool transport_open,usb_mounted,io_fault;
+/* Cross-core publication uses C11 sequentially consistent atomics throughout:
+ * main publishes epoch only after revoking OTA ownership/resetting queues;
+ * IO latches every observed disconnect before publishing transport_open.
+ * Acknowledgement follows main's revocation, never merely its observation. */
+static _Atomic uint32_t io_epoch,io_disconnects,io_disconnect_ack;
+static _Atomic bool transport_open,usb_mounted,io_fault;
 static bool online,terminal_open,opening,reset_input,boot_request,restart_request;
 static uint32_t epoch,session,next_session,rx_sequence,now,rx_time,hello_time,ping_time,status_time;
 static uint32_t granted,received,pending_update,update_deadline,update_grant,job;
 static bool rx_seen,job_running,credit_dirty;
 static uint32_t open_time,ota_session,ota_acked,ota_chunks,restart_at;
+static bool ota_v2, host_exchange;
+static uint32_t host_exchange_ms;
+static _Atomic uint32_t io_progress_ms;
+static _Atomic bool io_started;
 static int ota_notified=-1;
 static int job_percent;
 static char notice[96];
 static mix_view_t metrics;
+static uint16_t req_cols,req_rows;
+/* Screenshot transfer in flight, or 0. The framebuffer is 1.5 MiB and the
+ * control queue holds twelve frames, so the capture is pumped a few frames per
+ * tick from mix_link_tick rather than enqueued in one go: filling the queue is
+ * what faults the link and would drop the terminal with it. */
+static uint32_t shot_session,shot_offset,shot_total;
+static uint8_t shot_frame[4+MIX_SCREEN_CHUNK];
+static uint8_t open_app;
+static uint32_t net_session,net_deadline;
+static uint32_t time_base_s,time_base_ms;
+static mix_net_entry_t net_list[MIX_NET_MAX];
+static int net_count;
+static char net_message[96];
 static void set_notice(const char *s){snprintf(notice,sizeof(notice),"%s",s);}
 const char *mix_link_notice(void){return notice;}
+/* The host maps these to argv through its own fixed table; the identifier is
+ * the whole request and no command string ever crosses the link. */
+static const char *const app_names[MIX_APP_COUNT]={"translate","notes","agent","shell"};
 
 static bool enqueue(uint8_t ch,uint8_t type,uint32_t sid,const void *data,size_t len){
-    if(len>MIX_MAX_PAYLOAD||!epoch)return false;
+    if(len>MIX_MAX_PAYLOAD||!epoch||io_disconnects!=io_disconnect_ack)return false;
     mix_frame_t f={.channel=ch,.type=type,.epoch=epoch,.session=sid,.length=(uint16_t)len};
     if(len)memcpy(f.payload,data,len);
     QueueHandle_t q=type==MIX_INPUT?inputq:controlq;
-    if(xQueueSend(q,&f,0)!=pdTRUE){io_fault=true;set_notice("Link queue full; reconnecting safely");return false;}
+    if(xQueueSend(q,&f,0)!=pdTRUE){
+        /* OTA results are queryable; ordinary TX backpressure must not abort
+         * a receiving transaction by forcibly replacing the link epoch. */
+        if(ota_session||mix_ota_transaction_busy())return false;
+        io_fault=true;set_notice("Link queue full; reconnecting safely");return false;
+    }
     return true;
 }
 static void clear_session(void){
     terminal_open=opening=false;credit_dirty=false;session=0;granted=received=0;reset_input=true;
+    open_app=MIX_APP_SHELL;
     xQueueReset(inputq);
 }
-static void clear_ota(void){mix_ota_abort();mix_ota_reset();ota_session=ota_acked=ota_chunks=0;ota_notified=-1;}
+static void clear_ota(void){ota_session=ota_acked=ota_chunks=0;ota_notified=-1;ota_v2=false;}
+static void clear_screenshot(void){shot_session=shot_offset=shot_total=0;}
+/* Move a capture forward by whatever the control queue can take right now.
+ *
+ * Spare slots are left free on purpose: status, ping and terminal output share
+ * this queue, and a capture that filled it would stall the very UI it is
+ * photographing. A failed enqueue means the link is already resetting, so the
+ * transfer is simply dropped; the host sees no END and reports a short read.
+ */
+static void screenshot_pump(void){
+    if(!shot_session)return;
+    size_t bytes=0;
+    const uint8_t *pixels=(const uint8_t *)mix_ui_framebuffer(&bytes,NULL,NULL);
+    if(!pixels||bytes!=shot_total){clear_screenshot();return;}
+    while(shot_offset<shot_total&&uxQueueSpacesAvailable(controlq)>4){
+        uint32_t n=shot_total-shot_offset;
+        if(n>MIX_SCREEN_CHUNK)n=MIX_SCREEN_CHUNK;
+        mix_put32(shot_frame,shot_offset);
+        memcpy(shot_frame+4,pixels+shot_offset,n);
+        if(!enqueue(MIX_CH_MAINTENANCE,MIX_SCREEN_DATA,shot_session,shot_frame,4+n)){
+            clear_screenshot();return;
+        }
+        shot_offset+=n;
+    }
+    if(shot_offset>=shot_total){
+        uint8_t p[4];mix_put32(p,shot_total);
+        enqueue(MIX_CH_MAINTENANCE,MIX_SCREEN_END,shot_session,p,sizeof(p));
+        clear_screenshot();
+    }
+}
 static void restart_link(void){
+    static uint32_t previous_epoch;
+    io_epoch=0;
+    mix_ota_link_lost();host_exchange=false;
     online=false;clear_session();clear_ota();job=0;job_running=false;pending_update=update_grant=0;rx_seen=false;
+    clear_screenshot();
+    net_session=0;net_count=0;net_message[0]=0;
     epoch=esp_random();if(!epoch)epoch=1;
+    if(epoch==previous_epoch){epoch++;if(!epoch)epoch=1;}
+    previous_epoch=epoch;
     xQueueReset(controlq);xQueueReset(rxq);io_epoch=epoch;io_fault=false;
     rx_time=now;hello_time=now-1000;ping_time=status_time=now;
     metrics.linux_cpu=metrics.linux_temp=NAN;
     metrics.linux_mem_used_kib=metrics.linux_mem_total_kib=metrics.linux_uptime_s=0;
+    metrics.wifi_reported=metrics.wifi_connected=false;metrics.wifi_signal=-1;
+    metrics.wifi_ssid[0]=metrics.host_ip[0]=0;
+    metrics.host_time_s=0;metrics.host_tz_offset_min=0;
+}
+typedef struct {
+    mix_decoder_t decoder;
+    mix_frame_t rx,tx;
+    uint8_t wire[MIX_MAX_WIRE],buf[256];
+    size_t length,off;
+    uint32_t generation,sequence,filled,used;
+    bool rx_held,tx_held,delimiter_pending;
+} mix_io_t;
+/* IO alone owns this state. Queue reset cannot clear a held RX frame or a
+ * partially encoded TX frame: those must follow the same generation fence.
+ * Keep a dequeued NEW-generation frame when main changed epoch during dequeue.
+ * Frames enqueued late across a reset retain their old wire epoch; handle()
+ * rejects them even if the final queue send races main's queue reset. */
+static bool io_sync(mix_io_t *s){
+    uint32_t current=io_epoch;
+    bool ready=transport_open && io_disconnects==io_disconnect_ack && current;
+    if(!ready||s->generation!=current){
+        s->generation=current;s->sequence=0;
+        s->length=s->off=0;s->filled=s->used=0;s->rx_held=false;
+        memset(&s->decoder,0,sizeof(s->decoder));
+        s->delimiter_pending=true;
+        if(!ready||!s->tx_held||s->tx.epoch!=current)s->tx_held=false;
+    }
+    return ready;
 }
 /* Only this task touches CDC RX/TX. No terminal/UI/I2C calls inside it. */
 static void io_task(void *arg){
-    (void)arg;mix_decoder_t d={0};mix_frame_t rx,tx;
-    uint8_t wire[MIX_MAX_WIRE],buf[256];size_t length=0,off=0;
-    uint32_t generation=0,seq=0,filled=0,used=0;
-    bool held=false;
+    (void)arg;mix_io_t s={0};bool was_open=false;
+    if(mix_watchdog_task_begin(MIX_HEALTH_IO)!=ESP_OK){io_fault=true;vTaskDelete(NULL);return;}
+    io_started=true;
     for(;;){
-        transport_open=tud_cdc_connected();usb_mounted=tud_mounted();
-        if(generation!=io_epoch){
-            generation=io_epoch;seq=0;length=off=0;filled=used=0;held=false;memset(&d,0,sizeof(d));
-            /* Abort any partial old frame at a delimiter. */
-            if(transport_open){uint8_t zero=0;tud_cdc_write(&zero,1);tud_cdc_write_flush();}
+        /* Independent of whether Linux has mounted/opened CDC. */
+        io_progress_ms=(uint32_t)(esp_timer_get_time()/1000);
+        if(mix_watchdog_task_reset(MIX_HEALTH_IO)!=ESP_OK){io_fault=true;mix_watchdog_task_end(MIX_HEALTH_IO);vTaskDelete(NULL);return;}
+        bool connected=tud_cdc_connected();
+        if(was_open&&!connected)io_disconnects++;
+        was_open=connected;transport_open=connected;usb_mounted=tud_mounted();
+        if(!io_sync(&s)){
+            /* Reopening DTR does not resume the old session. Wait for main to
+             * revoke OTA ownership, but drain stale host bytes to avoid FIFO
+             * deadlock. A new HELLO cannot be sent before that acknowledgement. */
+            if(connected)tud_cdc_read(s.buf,sizeof(s.buf));
+            tud_cdc_write_flush();vTaskDelay(pdMS_TO_TICKS(5));continue;
         }
-        if(!transport_open){length=off=0;filled=used=0;held=false;memset(&d,0,sizeof(d));vTaskDelay(pdMS_TO_TICKS(5));continue;}
-        /* A decoded frame the link task has not taken yet is held here, and no
-         * further CDC bytes are drained until it fits. TinyUSB then stops
-         * accepting from the host, which is ordinary flow control. Faulting the
-         * link instead would restart the epoch and abandon a firmware transfer
-         * every time a flash erase kept the link task busy for a few
-         * milliseconds, which is exactly when the queue backs up. */
-        if(held&&xQueueSend(rxq,&rx,0)==pdTRUE)held=false;
-        for(int batch=0;batch<4&&!held;batch++){
-            if(used==filled){filled=tud_cdc_read(buf,sizeof(buf));used=0;if(!filled)break;}
-            while(used<filled&&!held)
-                if(mix_decoder_push(&d,buf[used++],&rx)&&xQueueSend(rxq,&rx,0)!=pdTRUE)held=true;
+        /* RX continues even when the TX delimiter is backpressured. */
+        if(s.rx_held&&xQueueSend(rxq,&s.rx,0)==pdTRUE)s.rx_held=false;
+        for(int batch=0;batch<4&&!s.rx_held;batch++){
+            uint32_t before=s.generation;
+            if(s.used==s.filled){s.filled=tud_cdc_read(s.buf,sizeof(s.buf));s.used=0;}
+            if(!io_sync(&s)||s.generation!=before||!s.filled)break;
+            while(s.used<s.filled&&!s.rx_held){
+                if(mix_decoder_push(&s.decoder,s.buf[s.used++],&s.rx)){
+                    if(s.rx.epoch==s.generation&&xQueueSend(rxq,&s.rx,0)!=pdTRUE)s.rx_held=true;
+                }
+            }
         }
-        if(!length){
-            bool sending=xQueueReceive(controlq,&tx,0)==pdTRUE;
-            if(!sending)sending=xQueueReceive(inputq,&tx,0)==pdTRUE;
-            if(sending&&tx.epoch==generation){tx.sequence=++seq;length=mix_frame_encode(&tx,wire,sizeof(wire));off=0;}
+        if(io_sync(&s)){
+            if(!s.length&&!s.tx_held){
+                s.tx_held=xQueueReceive(controlq,&s.tx,0)==pdTRUE;
+                if(!s.tx_held)s.tx_held=xQueueReceive(inputq,&s.tx,0)==pdTRUE;
+            }
+            /* Recheck AFTER dequeue: never discard a new-epoch HELLO merely
+             * because generation was cached before main's publication. */
+            if(io_sync(&s)){
+                if(s.tx_held&&s.tx.epoch!=s.generation)s.tx_held=false;
+                if(s.delimiter_pending){
+                    uint8_t zero=0;
+                    if(tud_cdc_write(&zero,1)==1)s.delimiter_pending=false;
+                }
+                /* A generation change during delimiter write requires another
+                 * delimiter. Never replace an incomplete delimiter with data. */
+                if(io_sync(&s)&&!s.delimiter_pending){
+                    if(s.tx_held&&!s.length){
+                        s.tx.sequence=++s.sequence;
+                        s.length=mix_frame_encode(&s.tx,s.wire,sizeof(s.wire));s.off=0;
+                    }
+                    if(s.length){
+                        uint32_t n=tud_cdc_write(s.wire+s.off,(uint32_t)(s.length-s.off));s.off+=n;
+                        if(s.off==s.length){s.length=s.off=0;s.tx_held=false;}
+                    }
+                }
+            }
         }
-        if(length){uint32_t n=tud_cdc_write(wire+off,(uint32_t)(length-off));off+=n;
-            if(off==length)length=off=0;}
         tud_cdc_write_flush();vTaskDelay(1);
     }
 }
 void tud_cdc_rx_cb(uint8_t itf){(void)itf;} /* FIFO serviced by io_task, backpressure by TinyUSB */
+/* A cursor-position or device-attribute answer is ordinary terminal input.
+ * Routing it through the same path keeps the credit and queue rules intact. */
+static void terminal_reply(const uint8_t *bytes,size_t len,void *ctx){
+    (void)ctx;mix_link_input(bytes,len);
+}
 esp_err_t mix_link_init(void){
     rxq=xQueueCreate(16,sizeof(mix_frame_t));controlq=xQueueCreate(12,sizeof(mix_frame_t));inputq=xQueueCreate(16,sizeof(mix_frame_t));
     if(!rxq||!controlq||!inputq)return ESP_ERR_NO_MEM;
-    metrics.linux_cpu=metrics.linux_temp=NAN;mix_terminal_init();return ESP_OK;
+    metrics.linux_cpu=metrics.linux_temp=NAN;metrics.wifi_signal=-1;
+    mix_terminal_init();mix_terminal_set_reply(terminal_reply,NULL);return ESP_OK;
 }
 esp_err_t mix_link_start_io(void){return xTaskCreate(io_task,"mix_usb",8192,NULL,6,NULL)==pdPASS?ESP_OK:ESP_ERR_NO_MEM;}
 bool mix_link_usb_mounted(void){return usb_mounted;}
+bool mix_link_io_healthy(uint32_t ms){return io_started&&(uint32_t)(ms-io_progress_ms)<2000u;}
+bool mix_link_host_healthy(uint32_t ms){return online&&host_exchange&&(uint32_t)(ms-host_exchange_ms)<6000u;}
+static void ota_replies(void){
+    mix_ota_reply_t reply;
+    /* Leave replies in the worker queue until control TX has capacity. */
+    while(uxQueueSpacesAvailable(controlq)>2&&mix_ota_poll_reply(&reply)){
+        enqueue(MIX_CH_MAINTENANCE,reply.type,reply.session,reply.payload,reply.length);
+        if(reply.type==MIX_OTA_READY){set_notice("Receiving firmware update");}
+        if(reply.type==MIX_OTA_DONE){
+            ota_session=0;
+            restart_at=(uint32_t)(esp_timer_get_time()/1000)+1200u;if(!restart_at)restart_at=1;
+            set_notice("Update verified; restarting");
+        }
+        if(reply.type==MIX_OTA_RESPONSE&&reply.length==MIX_OTA_RESPONSE_BYTES){
+            uint8_t phase=reply.payload[2],result=reply.payload[3];
+            if(reply.payload[1]==MIX_TX_BEGIN&&result==MIX_TX_OK&&phase==MIX_TX_RECEIVING){ota_session=reply.session;ota_v2=true;}
+            if(phase==MIX_TX_FAILED||phase==MIX_TX_ABORTED||phase==MIX_TX_CONFIRMED){clear_ota();}
+            if(reply.payload[1]==MIX_TX_BEGIN&&result!=MIX_TX_OK&&result!=MIX_TX_BUSY&&!mix_ota_transaction_busy())clear_ota();
+        }
+        if(reply.type==MIX_ERROR&&reply.session==ota_session&&mix_ota_state()!=MIX_OTA_RECEIVING){clear_ota();}
+    }
+}
 static double number(cJSON *j,const char *key){cJSON *v=cJSON_GetObjectItemCaseSensitive(j,key);return cJSON_IsNumber(v)?v->valuedouble:NAN;}
+static void copy_string(cJSON *j,const char *key,char *out,size_t cap){
+    cJSON *v=cJSON_GetObjectItemCaseSensitive(j,key);
+    if(cJSON_IsString(v)&&v->valuestring)snprintf(out,cap,"%s",v->valuestring);
+    else out[0]=0;
+}
+static uint32_t whole(double v){return isfinite(v)&&v>=0&&v<UINT32_MAX?(uint32_t)v:0;}
 static void json_metrics(const mix_frame_t *f){
     cJSON *j=cJSON_ParseWithLength((const char*)f->payload,f->length);if(!j)return;
     metrics.linux_cpu=(float)number(j,"cpu_pct");metrics.linux_temp=(float)number(j,"temp_c");
-    double a=number(j,"mem_used_kib"),b=number(j,"mem_total_kib"),c=number(j,"uptime_s");
-    metrics.linux_mem_used_kib=isfinite(a)&&a>=0&&a<UINT32_MAX?(uint32_t)a:0;
-    metrics.linux_mem_total_kib=isfinite(b)&&b>=0&&b<UINT32_MAX?(uint32_t)b:0;
-    metrics.linux_uptime_s=isfinite(c)&&c>=0&&c<UINT32_MAX?(uint32_t)c:0;cJSON_Delete(j);
+    metrics.linux_mem_used_kib=whole(number(j,"mem_used_kib"));
+    metrics.linux_mem_total_kib=whole(number(j,"mem_total_kib"));
+    metrics.linux_uptime_s=whole(number(j,"uptime_s"));
+    /* An absent Wi-Fi report stays absent. Reporting "0%" for a radio the host
+     * never described would be an invented measurement. */
+    cJSON *wifi=cJSON_GetObjectItemCaseSensitive(j,"wifi");
+    metrics.wifi_reported=cJSON_IsObject(wifi);
+    if(metrics.wifi_reported){
+        copy_string(wifi,"ssid",metrics.wifi_ssid,sizeof(metrics.wifi_ssid));
+        metrics.wifi_connected=cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(wifi,"connected"));
+        double s=number(wifi,"signal");
+        metrics.wifi_signal=(isfinite(s)&&s>=0&&s<=100)?(int)s:-1;
+    }else{
+        metrics.wifi_connected=false;metrics.wifi_signal=-1;metrics.wifi_ssid[0]=0;
+    }
+    copy_string(j,"ip",metrics.host_ip,sizeof(metrics.host_ip));
+    metrics.host_time_s=whole(number(j,"time_s"));
+    double tz=number(j,"tz_offset_min");
+    metrics.host_tz_offset_min=(isfinite(tz)&&tz>=-1440&&tz<=1440)?(int16_t)tz:0;
+    /* The host is polled every two seconds; the local monotonic clock carries
+     * the seconds in between so the status bar does not visibly stutter. */
+    if(metrics.host_time_s){time_base_s=metrics.host_time_s;time_base_ms=now;}
+    cJSON_Delete(j);
 }
 static void credit(void){uint8_t b[4];mix_put32(b,granted);enqueue(MIX_CH_TERMINAL,MIX_CREDIT,session,b,4);}
+/* Scan results arrive packed rather than as JSON: at 35 bytes per entry a
+ * single 512-byte frame carries a full list, and the parser needs no allocator. */
+static void net_scan_result(const mix_frame_t *f){
+    net_count=0;
+    if(!f->length)return;
+    unsigned entries=f->payload[0],at=1;
+    for(unsigned i=0;i<entries&&net_count<MIX_NET_MAX;i++){
+        if(at+3>f->length)break;
+        uint8_t flags=f->payload[at],signal=f->payload[at+1],len=f->payload[at+2];
+        at+=3;
+        if(len>MIX_SSID_MAX||at+len>f->length)break;
+        mix_net_entry_t *e=&net_list[net_count++];
+        memcpy(e->ssid,f->payload+at,len);e->ssid[len]=0;
+        e->signal=signal>100?100:signal;
+        e->secured=(flags&1)!=0;e->known=(flags&2)!=0;
+        at+=len;
+    }
+}
+static void net_frame(const mix_frame_t *f){
+    if(!net_session||f->session!=net_session)return;
+    if(f->type==MIX_NET_LIST){
+        net_scan_result(f);net_session=0;
+        snprintf(net_message,sizeof(net_message),"%d network%s found",net_count,net_count==1?"":"s");
+        return;
+    }
+    if(f->type==MIX_NET_RESULT||f->type==MIX_ERROR){
+        const uint8_t *text=f->payload;size_t len=f->length;
+        if(f->type==MIX_NET_RESULT&&len){text++;len--;}
+        size_t cap=sizeof(net_message)-1;
+        if(len>cap)len=cap;
+        memcpy(net_message,text,len);net_message[len]=0;
+        if(!net_message[0])snprintf(net_message,sizeof(net_message),"%s",
+            f->type==MIX_ERROR?"Network request refused":"Done");
+        net_session=0;
+        return;
+    }
+}
+static bool net_request(uint8_t type,const void *payload,size_t len){
+    if(!online||net_session)return false;
+    /* A counter, not a clock: two requests in the same millisecond must not
+     * share an identifier and confuse each other's replies. */
+    static uint32_t next_net;
+    net_session=0x40000000u|(++next_net&0x3fffffffu);
+    if(!net_session)net_session=0x40000001u;
+    if(!enqueue(MIX_CH_NET,type,net_session,payload,len)){net_session=0;return false;}
+    net_deadline=now+20000;net_message[0]=0;
+    return true;
+}
+static size_t pack_string(uint8_t *out,size_t at,size_t cap,const char *s,size_t max_len){
+    size_t len=s?strlen(s):0;
+    if(len>max_len)len=max_len;
+    if(at+1+len>cap)return at;
+    out[at++]=(uint8_t)len;memcpy(out+at,s,len);return at+len;
+}
 static void maintenance_error(uint32_t sid,const char *reason){
     enqueue(MIX_CH_MAINTENANCE,MIX_ERROR,sid,reason,strlen(reason));
 }
@@ -114,7 +345,7 @@ static void maintenance(const mix_frame_t *f){
     switch(f->type){
     case MIX_PREPARE_UPDATE:
         /* Legacy ROM-download escape hatch, kept for full-flash recovery. */
-        if(f->length||pending_update||boot_request||ota_session)return;
+        if(f->length||pending_update||boot_request||ota_session||mix_ota_transaction_busy())return;
         mix_link_close_terminal();
         if(enqueue(MIX_CH_MAINTENANCE,MIX_UPDATE_READY,f->session,NULL,0)){
             pending_update=update_grant=f->session;update_deadline=now+15000;
@@ -126,68 +357,84 @@ static void maintenance(const mix_frame_t *f){
             update_grant=pending_update=0;clear_session();boot_request=true;
         }
         return;
-    case MIX_OTA_BEGIN:{
-        if(f->length!=36){maintenance_error(f->session,"OTA_BEGIN needs size and sha256");return;}
-        if(ota_session&&ota_session!=f->session){maintenance_error(f->session,"another update is active");return;}
+    case MIX_OTA_CAPS_QUERY:{
+        if(f->length)return;
+        uint8_t p[MIX_OTA_CAP_BYTES];size_t n=mix_ota_capabilities(p,sizeof(p));
+        if(n)enqueue(MIX_CH_MAINTENANCE,MIX_OTA_CAPS,f->session,p,n);
+        else maintenance_error(f->session,"OTA worker unavailable");
+        return;}
+    case MIX_OTA_REQUEST:{
         if(pending_update||boot_request){maintenance_error(f->session,"ROM download already authorized");return;}
-        if(restart_at){maintenance_error(f->session,"update already staged; reboot pending");return;}
-        mix_link_close_terminal();
-        esp_err_t e=mix_ota_begin(mix_get32(f->payload),f->payload+4);
-        if(e!=ESP_OK){maintenance_error(f->session,mix_ota_error());clear_ota();return;}
-        ota_session=f->session;ota_acked=ota_chunks=0;ota_notified=-1;
-        uint8_t p[12];
-        mix_put32(p,MIX_OTA_CHUNK);mix_put32(p+4,MIX_OTA_WINDOW);mix_put32(p+8,mix_get32(f->payload));
-        if(!enqueue(MIX_CH_MAINTENANCE,MIX_OTA_READY,f->session,p,sizeof(p)))clear_ota();
-        else set_notice("Receiving firmware update 0%");
+        if(f->length==MIX_OTA_REQUEST_BYTES&&f->payload[1]==MIX_TX_BEGIN){
+            if(ota_session&&ota_session!=f->session){maintenance_error(f->session,"another update owns link");return;}
+            mix_link_close_terminal();clear_screenshot();
+            if(!ota_session){ota_session=f->session;ota_v2=true;}
+        }
+        if(!mix_ota_submit_request(f->session,f->payload,f->length))maintenance_error(f->session,"OTA worker unavailable");
         return;}
-    case MIX_OTA_DATA:{
-        if(!ota_session||f->session!=ota_session)return;
-        if(f->length<5){maintenance_error(f->session,"short OTA_DATA");clear_ota();return;}
-        esp_err_t e=mix_ota_write(mix_get32(f->payload),f->payload+4,f->length-4);
-        if(e==ESP_ERR_INVALID_STATE&&mix_ota_state()==MIX_OTA_RECEIVING){
-            ota_ack(f->session);ota_chunks=0;return; /* out of order: resynchronise */
-        }
-        if(e!=ESP_OK){maintenance_error(f->session,mix_ota_error());clear_ota();return;}
-        if(++ota_chunks>=MIX_OTA_ACK_EVERY||mix_ota_received()==mix_ota_total()){
-            ota_chunks=0;ota_acked=mix_ota_received();ota_ack(f->session);
-        }
-        int percent=mix_ota_percent();
-        if(percent/5!=ota_notified){
-            ota_notified=percent/5;
-            char b[48];snprintf(b,sizeof(b),"Receiving firmware update %d%%",percent);set_notice(b);
-        }
-        return;}
-    case MIX_OTA_STATUS:
-        if(ota_session&&f->session==ota_session)ota_ack(f->session);
+    case MIX_OTA_BEGIN:
+        if(f->length!=36){maintenance_error(f->session,"OTA_BEGIN needs size and sha256");return;}
+        if(ota_session&&(ota_session!=f->session||ota_v2)){maintenance_error(f->session,"another update is active");return;}
+        if(pending_update||boot_request||restart_at){maintenance_error(f->session,"boot already pending");return;}
+        mix_link_close_terminal();clear_screenshot();
+        if(mix_ota_submit_legacy(f->type,f->session,f->payload,f->length)){
+            ota_session=f->session;ota_v2=false;ota_notified=-1;
+        }else maintenance_error(f->session,"OTA worker busy; query before retry");
         return;
-    case MIX_OTA_END:{
-        if(!ota_session||f->session!=ota_session||f->length)return;
-        esp_err_t e=mix_ota_finish();
-        if(e!=ESP_OK){maintenance_error(f->session,mix_ota_error());clear_ota();return;}
-        uint8_t p[4];mix_put32(p,mix_ota_total());
-        enqueue(MIX_CH_MAINTENANCE,MIX_OTA_DONE,f->session,p,sizeof(p));
-        /* Zero doubles as "no reboot pending", so a deadline that lands exactly
-         * on the millisecond counter's wrap must not silently cancel the reboot
-         * and strand a verified image that is already the boot partition. */
-        ota_session=0;restart_at=now+1200;if(!restart_at)restart_at=1;
-        set_notice("Update verified; restarting into the new build");
+    case MIX_OTA_DATA:
+    case MIX_OTA_STATUS:
+        if(!ota_session||f->session!=ota_session)return;
+        /* Queue pressure leaves offset unchanged; cumulative ACK/query lets the
+         * host retransmit without running flash from the UI thread. */
+        if(!mix_ota_submit_legacy(f->type,f->session,f->payload,f->length))ota_ack(f->session);
+        return;
+    /* Answerable whenever the UI exists, including with no update in progress:
+     * its whole purpose is to let the host see what is actually on the panel. */
+    case MIX_SCREEN_REQUEST:{
+        if(f->length)return;
+        if(ota_session||mix_ota_transaction_busy()){maintenance_error(f->session,"capture deferred during firmware update");return;}
+        /* Session zero would make shot_session indistinguishable from idle. */
+        if(!f->session)return;
+        if(shot_session){maintenance_error(f->session,"capture already in progress");return;}
+        size_t bytes=0;uint16_t w=0,h=0;
+        if(!mix_ui_framebuffer(&bytes,&w,&h)||!bytes){
+            maintenance_error(f->session,"framebuffer unavailable");return;}
+        uint8_t p[12];
+        mix_put16(p,w);mix_put16(p+2,h);
+        mix_put32(p+4,(uint32_t)bytes);
+        mix_put32(p+8,MIX_SCREEN_CHUNK);
+        if(!enqueue(MIX_CH_MAINTENANCE,MIX_SCREEN_INFO,f->session,p,sizeof(p)))return;
+        shot_session=f->session;shot_offset=0;shot_total=(uint32_t)bytes;
         return;}
+    /* Deliberately answerable with no transfer in progress and in a session
+     * the device has never seen before: the host asks this after the reboot,
+     * over a link that was re-established from scratch. */
+    case MIX_OTA_IDENTIFY:{
+        if(f->length)return;
+        uint8_t p[MIX_OTA_IDENTITY_BYTES];
+        size_t n=mix_ota_identity(p,sizeof(p));
+        if(!n){maintenance_error(f->session,"identity unavailable");return;}
+        enqueue(MIX_CH_MAINTENANCE,MIX_OTA_IDENTITY,f->session,p,n);
+        return;}
+    case MIX_OTA_END:
     case MIX_OTA_ABORT:
-        if(ota_session&&f->session==ota_session){clear_ota();set_notice("Firmware update cancelled");}
+        if(f->length||!ota_session||f->session!=ota_session)return;
+        if(ota_v2){maintenance_error(f->session,"v2 control command required");return;}
+        if(!mix_ota_submit_legacy(f->type,f->session,NULL,0))maintenance_error(f->session,"OTA worker busy; query before retry");
         return;
     default:
         return;
     }
 }
 static void handle(const mix_frame_t *f){
-    if(f->epoch!=epoch)return;
+    if(io_disconnects!=io_disconnect_ack||!transport_open||f->epoch!=epoch)return;
     if(rx_seen&&(int32_t)(f->sequence-rx_sequence)<=0)return;
     rx_seen=true;rx_sequence=f->sequence;
     if(f->channel==MIX_CH_CONTROL&&f->session==0){
         if(f->type==MIX_HELLO_ACK&&f->length==4&&mix_get16(f->payload)==MIX_MAX_PAYLOAD&&mix_get16(f->payload+2)==MIX_RX_WINDOW){online=true;rx_time=now;set_notice("Linux connected");return;}
         if(!online)return;
         if(f->type==MIX_PING&&f->length==0)enqueue(MIX_CH_CONTROL,MIX_PONG,0,NULL,0);
-        if(f->type==MIX_PING||f->type==MIX_PONG)rx_time=now;
+        if((f->type==MIX_PING||f->type==MIX_PONG)&&f->length==0){rx_time=now;host_exchange=true;host_exchange_ms=now;}
     }
     if(!online)return;
     if(f->channel==MIX_CH_CONTROL&&f->type==MIX_ERROR){
@@ -197,7 +444,7 @@ static void handle(const mix_frame_t *f){
     }
     if(f->channel==MIX_CH_TERMINAL&&session&&f->session==session){
         if(f->type==MIX_OPENED&&opening&&f->length==4){
-            if(mix_get16(f->payload)!=MIX_TERM_COLS||mix_get16(f->payload+2)!=MIX_TERM_ROWS){mix_link_close_terminal();set_notice("Unsupported terminal geometry");return;}
+            if(mix_get16(f->payload)!=req_cols||mix_get16(f->payload+2)!=req_rows){mix_link_close_terminal();set_notice("Unsupported terminal geometry");return;}
             opening=false;terminal_open=true;mix_terminal_init();granted=MIX_RX_WINDOW;received=0;credit_dirty=true;reset_input=true;
         }else if(f->type==MIX_DATA&&terminal_open){
             uint32_t avail=granted-received;
@@ -212,48 +459,108 @@ static void handle(const mix_frame_t *f){
         if(f->type==MIX_JOB_RESULT||f->type==MIX_ERROR){job_running=false;set_notice(f->type==MIX_ERROR?"Linux task failed":"Linux task completed");}
     }
     if(f->channel==MIX_CH_MAINTENANCE)maintenance(f);
+    if(f->channel==MIX_CH_NET)net_frame(f);
 }
 void mix_link_tick(uint32_t now_ms,mix_view_t *v){
     now=now_ms;
-    if(!transport_open){
-        if(epoch){online=false;clear_session();clear_ota();epoch=io_epoch=0;pending_update=update_grant=0;job_running=false;set_notice("Linux disconnected");}
-    }else{
-        if(!epoch||io_fault||(uint32_t)(now-rx_time)>8000)restart_link();
+    uint32_t disconnects=io_disconnects;
+    if(!transport_open||disconnects!=io_disconnect_ack){
+        io_epoch=0;
+        if(epoch){mix_ota_link_lost();host_exchange=false;online=false;clear_session();clear_ota();epoch=0;pending_update=update_grant=0;job_running=false;set_notice("Linux disconnected");}
+        xQueueReset(controlq);xQueueReset(rxq);
+        /* Acknowledge only this snapshot AFTER revocation. A second disconnect
+         * racing this tick remains pending and keeps IO gated. */
+        io_disconnect_ack=disconnects;
+    }
+    if(transport_open&&io_disconnects==io_disconnect_ack){
+        if(!epoch||io_fault)restart_link();
         mix_frame_t f;for(int i=0;i<16&&xQueueReceive(rxq,&f,0)==pdTRUE;i++)handle(&f);
+        /* Consume queued valid heartbeats before judging their deadline. */
+        if((uint32_t)(now-rx_time)>8000)restart_link();
+        ota_replies();
         if(!online&&(uint32_t)(now-hello_time)>=1000){uint8_t p[4];mix_put16(p,MIX_MAX_PAYLOAD);mix_put16(p+2,MIX_RX_WINDOW);enqueue(MIX_CH_CONTROL,MIX_HELLO,0,p,4);hello_time=now;}
         if(credit_dirty&&terminal_open){credit_dirty=false;credit();}
         if(opening&&(uint32_t)(now-open_time)>5000){mix_link_close_terminal();set_notice("Terminal open timed out");}
         if(online&&(uint32_t)(now-ping_time)>=2000){enqueue(MIX_CH_CONTROL,MIX_PING,0,NULL,0);ping_time=now;}
         if(online&&(uint32_t)(now-status_time)>=2000){enqueue(MIX_CH_STATUS,MIX_STATUS_REQUEST,0,NULL,0);status_time=now;}
         if(pending_update&&(int32_t)(now-update_deadline)>=0){pending_update=update_grant=0;set_notice("Host update grant expired");}
+        if(net_session&&(int32_t)(now-net_deadline)>=0){
+            net_session=0;snprintf(net_message,sizeof(net_message),"Network request timed out");
+        }
+        screenshot_pump();
     }
-    /* Report the true write position once per tick whenever it moved. The host
-     * then never has to wait for a timeout because an acknowledgement landed on
-     * a chunk boundary it did not predict, and a window that was cut short by
-     * queue pressure reopens on the next tick instead of stalling. */
-    if(ota_session&&mix_ota_state()==MIX_OTA_RECEIVING&&mix_ota_received()!=ota_acked){
-        ota_acked=mix_ota_received();ota_chunks=0;ota_ack(ota_session);
-    }
-    mix_ota_tick(now);
-    if(ota_session&&mix_ota_state()!=MIX_OTA_RECEIVING){
-        maintenance_error(ota_session,mix_ota_error());set_notice(mix_ota_error());clear_ota();
-    }
-    if(restart_at&&(int32_t)(now-restart_at)>=0){restart_at=0;restart_request=true;}
+    /* The OTA worker alone owns stall checks, abort and confirmation. */
+    if(ota_session&&!mix_ota_transaction_busy()&&mix_ota_state()==MIX_OTA_FAILED){clear_ota();}
+    if(mix_ota_take_worker_restart()){restart_at=0;restart_request=true;}
     v->linux_online=online;v->terminal_open=terminal_open;
-    v->maintenance_busy=pending_update||ota_session||restart_at;
+    v->maintenance_busy=pending_update||ota_session||restart_at||mix_ota_transaction_busy();
     v->ota_state=(uint8_t)mix_ota_state();v->ota_percent=mix_ota_percent();
     v->job_running=job_running;v->job_percent=job_percent;
     v->linux_cpu=online?metrics.linux_cpu:NAN;v->linux_temp=online?metrics.linux_temp:NAN;
     v->linux_mem_used_kib=online?metrics.linux_mem_used_kib:0;v->linux_mem_total_kib=online?metrics.linux_mem_total_kib:0;
     v->linux_uptime_s=online?metrics.linux_uptime_s:0;
+    v->running_app=open_app;
+    v->wifi_reported=online&&metrics.wifi_reported;
+    v->wifi_connected=v->wifi_reported&&metrics.wifi_connected;
+    v->wifi_signal=v->wifi_reported?metrics.wifi_signal:-1;
+    snprintf(v->wifi_ssid,sizeof(v->wifi_ssid),"%s",v->wifi_reported?metrics.wifi_ssid:"");
+    snprintf(v->host_ip,sizeof(v->host_ip),"%s",online?metrics.host_ip:"");
+    /* Time keeps running on the local monotonic clock once the host has said
+     * what time it is, so a dropped link blanks the network, not the clock. */
+    v->host_time_s=time_base_s?time_base_s+(now-time_base_ms)/1000u:0;
+    v->host_tz_offset_min=metrics.host_tz_offset_min;
 }
-bool mix_link_open_terminal(void){
-    if(!online||pending_update||ota_session)return false;if(terminal_open||opening)return true;
+bool mix_link_open_app(mix_app_t app){
+    if(!online||pending_update||ota_session)return false;
+    if((unsigned)app>=MIX_APP_COUNT)return false;
+    /* A session already showing the requested application *is* the answer to
+     * the request, so pressing the same card twice keeps the half-written note
+     * rather than throwing it away. A session showing a different application
+     * is not: it has to end first. The host refuses a second OPEN while one
+     * session is alive ("terminal already open"), so returning true here left
+     * the screen drawing the old application while the UI titled it as the new
+     * one. CLOSE and OPEN travel the same channel in order, so by the time the
+     * host reads the OPEN it has already torn the old pseudo-terminal down. */
+    if(terminal_open||opening){
+        if(open_app==(uint8_t)app)return true;
+        mix_link_close_terminal();
+    }
     session=++next_session;if(!session)session=++next_session;
-    uint8_t p[4];mix_put16(p,MIX_TERM_COLS);mix_put16(p+2,MIX_TERM_ROWS);
-    open_time=now;opening=enqueue(MIX_CH_TERMINAL,MIX_OPEN,session,p,4);return opening;
+    req_cols=(uint16_t)mix_terminal_cols();req_rows=(uint16_t)mix_terminal_rows();
+    const char *name=app_names[app];
+    size_t name_len=strlen(name);
+    uint8_t p[5+16];
+    mix_put16(p,req_cols);mix_put16(p+2,req_rows);
+    p[4]=(uint8_t)name_len;memcpy(p+5,name,name_len);
+    open_time=now;open_app=(uint8_t)app;
+    opening=enqueue(MIX_CH_TERMINAL,MIX_OPEN,session,p,5+name_len);
+    if(!opening)session=0;
+    return opening;
 }
 void mix_link_close_terminal(void){if(session&&online)enqueue(MIX_CH_TERMINAL,MIX_CLOSE,session,NULL,0);clear_session();}
+void mix_link_resize(int cols,int rows){
+    if(!terminal_open||cols<1||rows<1)return;
+    req_cols=(uint16_t)cols;req_rows=(uint16_t)rows;
+    uint8_t p[4];mix_put16(p,req_cols);mix_put16(p+2,req_rows);
+    enqueue(MIX_CH_TERMINAL,MIX_RESIZE,session,p,4);
+}
+bool mix_link_net_scan(void){return net_request(MIX_NET_SCAN,NULL,0);}
+bool mix_link_net_connect(const char *ssid,const char *passphrase){
+    if(!ssid||!*ssid)return false;
+    uint8_t p[1+MIX_SSID_MAX+1+64];
+    size_t at=pack_string(p,0,sizeof(p),ssid,MIX_SSID_MAX);
+    at=pack_string(p,at,sizeof(p),passphrase,63);
+    return net_request(MIX_NET_CONNECT,p,at);
+}
+bool mix_link_net_forget(const char *ssid){
+    if(!ssid||!*ssid)return false;
+    uint8_t p[1+MIX_SSID_MAX];
+    size_t at=pack_string(p,0,sizeof(p),ssid,MIX_SSID_MAX);
+    return net_request(MIX_NET_FORGET,p,at);
+}
+int mix_link_net_list(const mix_net_entry_t **out){if(out)*out=net_list;return net_count;}
+bool mix_link_net_busy(void){return net_session!=0;}
+const char *mix_link_net_message(void){return net_message;}
 bool mix_link_input(const uint8_t *b,size_t n){
     if(!terminal_open||pending_update||ota_session||!n)return false;
     if(n>MIX_MAX_PAYLOAD||!enqueue(MIX_CH_TERMINAL,MIX_INPUT,session,b,n)){mix_link_close_terminal();return false;}return true;

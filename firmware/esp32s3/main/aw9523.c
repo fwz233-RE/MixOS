@@ -4,6 +4,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "board_pins.h"
+#include "mix_i2c.h"
 #include "freertos/semphr.h"
 
 static SemaphoreHandle_t s_lock;
@@ -14,6 +15,30 @@ static void aw_lock(void) { if (s_lock) xSemaphoreTakeRecursive(s_lock, portMAX_
 static void aw_unlock(void) { if (s_lock) xSemaphoreGiveRecursive(s_lock); }
 
 static const char *TAG = "AW9523";
+
+/* Why this file no longer uses ESP_ERROR_CHECK
+ * --------------------------------------------
+ * ESP_ERROR_CHECK aborts and reboots the device. Every caller of this driver
+ * already handles failure: main.c checks aw9523_init()'s return value and
+ * degrades to a printed recovery hint, and aw9523_gt911_reset()'s result
+ * decides whether touch is available. Aborting inside meant a single I2C NAK
+ * rebooted the board before any of that code could run, so the fault tolerance
+ * that had been written was unreachable.
+ *
+ * AW_TRY propagates the error instead. Failure here is recoverable: the health
+ * check in the device task rebuilds the expander, and the UI stays usable
+ * without touch.
+ */
+#define AW_TRY(expr)                                                        \
+    do {                                                                    \
+        esp_err_t aw_try_err_ = (expr);                                     \
+        if (aw_try_err_ != ESP_OK) {                                        \
+            ESP_LOGE(TAG, "%s failed at %s:%d: %s", #expr, __func__,        \
+                     __LINE__, esp_err_to_name(aw_try_err_));               \
+            return aw_try_err_;                                             \
+        }                                                                   \
+    } while (0)
+
 
 // ---- 开机取证快照（见 aw9523.h 注释）----
 const uint8_t aw9523_snap_regs[AW9523_SNAP_COUNT] = {
@@ -42,17 +67,18 @@ uint8_t aw9523_int_p0_expected(void)
 
 esp_err_t aw9523_read_reg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t *val)
 {
+    /* Both locks are taken: the AW lock protects this driver's expected-state
+     * bookkeeping, the bus lock protects the transfer against a bus reset. */
     aw_lock();
-    esp_err_t err = i2c_master_transmit_receive(dev, &reg, 1, val, 1, 100);
+    esp_err_t err = mix_i2c_read_u8(dev, reg, val);
     aw_unlock();
     return err;
 }
 
 esp_err_t aw9523_write_reg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t val)
 {
-    uint8_t buf[2] = { reg, val };
     aw_lock();
-    esp_err_t err = i2c_master_transmit(dev, buf, 2, 100);
+    esp_err_t err = mix_i2c_write_u8(dev, reg, val);
     if (!s_rebuilding) { // Remember intent even on failure; health task retries it.
         if (reg == AW9523_REG_OUTPUT_P1) s_expected_out1 = val;
         if (reg == AW9523_REG_CONFIG_P1) s_expected_cfg1 = val;
@@ -74,27 +100,41 @@ esp_err_t aw9523_update_bits(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t m
     return err;
 }
 
-esp_err_t aw9523_init(i2c_master_bus_handle_t bus, i2c_master_dev_handle_t *out_dev)
+esp_err_t aw9523_init(i2c_master_dev_handle_t *out_dev)
 {
+    /* The bus handle is no longer a parameter: mix_i2c owns it, and passing a
+     * second handle around only invited a driver to bypass the bus lock. */
     if (!s_lock) s_lock = xSemaphoreCreateRecursiveMutex();
     if (!s_lock) return ESP_ERR_NO_MEM;
-    i2c_device_config_t dev_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = AW9523_I2C_ADDR,
-        .scl_speed_hz = 100 * 1000,
-    };
-    i2c_master_dev_handle_t dev;
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus, &dev_cfg, &dev));
+    i2c_master_dev_handle_t dev = mix_i2c_add_device(AW9523_I2C_ADDR, I2C_STANDARD_HZ);
+    if (!dev) return ESP_ERR_NOT_FOUND;
+
+    /* From here on every early return must remove the device handle again;
+     * leaking it kept the 0x5B address claimed on the bus after a failed
+     * probe, so a later retry could not add it back. */
+    esp_err_t err;
+    #define AW_TRY_DEV(expr)                                                \
+        do {                                                                \
+            esp_err_t aw_dev_err_ = (expr);                                 \
+            if (aw_dev_err_ != ESP_OK) {                                    \
+                ESP_LOGE(TAG, "%s failed at line %d: %s", #expr, __LINE__,  \
+                         esp_err_to_name(aw_dev_err_));                     \
+                mix_i2c_rm_device(dev);                                     \
+                return aw_dev_err_;                                         \
+            }                                                               \
+        } while (0)
 
     // ---- 自检：读芯片 ID ----
     uint8_t id = 0;
-    esp_err_t err = aw9523_read_reg(dev, AW9523_REG_ID, &id);
+    err = aw9523_read_reg(dev, AW9523_REG_ID, &id);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "0x5B 无应答: %s（查 R72/R87、U16 供电/RSTN 上拉）", esp_err_to_name(err));
+        mix_i2c_rm_device(dev);
         return err;
     }
     if (id != AW9523_CHIP_ID) {
         ESP_LOGE(TAG, "ID 寄存器 = 0x%02X，期望 0x23，芯片异常", id);
+        mix_i2c_rm_device(dev);
         return ESP_ERR_INVALID_RESPONSE;
     }
     ESP_LOGI(TAG, "AW9523B OK (ID=0x23 @0x5B)");
@@ -116,11 +156,11 @@ esp_err_t aw9523_init(i2c_master_bus_handle_t bus, i2c_master_dev_handle_t *out_
 
     // ---- 配置（不做软复位，避免其它已在用的输出瞬间跳变）----
     // 1. 屏蔽全部中断：INTN 经 R82 搭在 ESP_LCD_CS(GPIO5) 上，绝不能让它拉低
-    ESP_ERROR_CHECK(aw9523_write_reg(dev, AW9523_REG_INT_P0, 0xFF));
-    ESP_ERROR_CHECK(aw9523_write_reg(dev, AW9523_REG_INT_P1, 0xFF));
+    AW_TRY_DEV(aw9523_write_reg(dev, AW9523_REG_INT_P0, 0xFF));
+    AW_TRY_DEV(aw9523_write_reg(dev, AW9523_REG_INT_P1, 0xFF));
     // 2. 全部端口 GPIO 模式（非 LED 电流源）
-    ESP_ERROR_CHECK(aw9523_write_reg(dev, AW9523_REG_LEDMODE_P0, 0xFF));
-    ESP_ERROR_CHECK(aw9523_write_reg(dev, AW9523_REG_LEDMODE_P1, 0xFF));
+    AW_TRY_DEV(aw9523_write_reg(dev, AW9523_REG_LEDMODE_P0, 0xFF));
+    AW_TRY_DEV(aw9523_write_reg(dev, AW9523_REG_LEDMODE_P1, 0xFF));
     // 3. 绝对写入（不用 update_bits）——AW9523 不随 ESP 复位，寄存器会残留
     //    上一版固件的状态，必须强制写成确定状态。
     //    ⚠️ 只驱动真正要控的 3 根线，其余 13 脚一律输入 Hi-Z（网表逐脚核实，
@@ -136,18 +176,18 @@ esp_err_t aw9523_init(i2c_master_bus_handle_t bus, i2c_master_dev_handle_t *out_
     //    先写 CONFIG 把不要的脚全部转输入释放（此时输出寄存器仍是高/残留值，
     //    输入态不驱动，无任何毛刺），再写 OUTPUT 只影响留下的输出脚。
     //    （"先 OUTPUT 后 CONFIG"仅适用于上一版故意抑制 CM 上电的固件。）
-    ESP_ERROR_CHECK(aw9523_write_reg(dev, AW9523_REG_CONFIG_P0,
-                                     0xFF & ~AW9523_P0_MUX_SEL));                     // 0xFE
-    ESP_ERROR_CHECK(aw9523_write_reg(dev, AW9523_REG_CONFIG_P1,
-                                     0xFF & ~(AW9523_P1_LCD_RST | AW9523_P1_TP_RST)));// 0xED
+    AW_TRY_DEV(aw9523_write_reg(dev, AW9523_REG_CONFIG_P0,
+                                0xFF & ~AW9523_P0_MUX_SEL));                     // 0xFE
+    AW_TRY_DEV(aw9523_write_reg(dev, AW9523_REG_CONFIG_P1,
+                                0xFF & ~(AW9523_P1_LCD_RST | AW9523_P1_TP_RST)));// 0xED
     // 4. P0 推挽输出（默认开漏推不高 MUX_SEL）。放在 CONFIG 之后：此刻 P0 只剩
     //    P0_0 一个输出，切推挽不会波及其它脚。
-    ESP_ERROR_CHECK(aw9523_update_bits(dev, AW9523_REG_GCR, 1 << 4, 1 << 4));
+    AW_TRY_DEV(aw9523_update_bits(dev, AW9523_REG_GCR, 1 << 4, 1 << 4));
     // 5. 输出电平：MUX_SEL(P0_0)=1 先切 ESP 侧做 LCD SPI 初始化 + GT911 复位；
     //    LCD_RST(P1_1)=1 / TP_RST(P1_4)=1 复位线保持释放
-    ESP_ERROR_CHECK(aw9523_write_reg(dev, AW9523_REG_OUTPUT_P0, AW9523_P0_MUX_SEL));  // 0x01
-    ESP_ERROR_CHECK(aw9523_write_reg(dev, AW9523_REG_OUTPUT_P1,
-                                     AW9523_P1_LCD_RST | AW9523_P1_TP_RST));          // 0x12
+    AW_TRY_DEV(aw9523_write_reg(dev, AW9523_REG_OUTPUT_P0, AW9523_P0_MUX_SEL));  // 0x01
+    AW_TRY_DEV(aw9523_write_reg(dev, AW9523_REG_OUTPUT_P1,
+                                AW9523_P1_LCD_RST | AW9523_P1_TP_RST));          // 0x12
 
     // 回读全部关键寄存器，验证配置真的写进去了
     struct { uint8_t reg; const char *name; } dump[] = {
@@ -159,12 +199,20 @@ esp_err_t aw9523_init(i2c_master_bus_handle_t bus, i2c_master_dev_handle_t *out_
     };
     for (int i = 0; i < sizeof(dump) / sizeof(dump[0]); i++) {
         uint8_t v = 0;
-        aw9523_read_reg(dev, dump[i].reg, &v);
+        esp_err_t dump_err = aw9523_read_reg(dev, dump[i].reg, &v);
+        if (dump_err != ESP_OK) {
+            // Printing an uninitialised v here used to make a failed read look
+            // like a register that reads back as 0x00.
+            ESP_LOGW(TAG, "  [0x%02X] %s = <read failed: %s>", dump[i].reg,
+                     dump[i].name, esp_err_to_name(dump_err));
+            continue;
+        }
         ESP_LOGI(TAG, "  [0x%02X] %s = 0x%02X", dump[i].reg, dump[i].name, v);
     }
     ESP_LOGI(TAG, "MUX_SEL(P0_0)=1 已切 ESP 侧, CM_PMIC_EN(P0_2)=输入Hi-Z(CM 自启不干预), "
                   "LCD_RST(P1_1)=1, TP_RST(P1_4)=1, 其余 13 脚全输入 Hi-Z");
 
+    #undef AW_TRY_DEV
     *out_dev = dev;
     return ESP_OK;
 }
@@ -222,20 +270,23 @@ bool aw9523_state_matches(i2c_master_dev_handle_t dev)
 // 结束立即还回输入交还 GT911。
 esp_err_t aw9523_gt911_reset(i2c_master_dev_handle_t dev)
 {
+    /* Each step is propagated rather than aborted: main.c treats a failed
+     * touch reset as "no touch panel" and keeps the rest of the UI running. */
     // RST=0、INT=0（INT 暂时改输出低，R20 10K 上拉下灌 ~0.33mA 无害）
-    ESP_ERROR_CHECK(aw9523_update_bits(dev, AW9523_REG_OUTPUT_P1,
-                                       AW9523_P1_TP_RST | AW9523_P1_TP_INT, 0x00));
-    ESP_ERROR_CHECK(aw9523_update_bits(dev, AW9523_REG_CONFIG_P1,
-                                       AW9523_P1_TP_INT, 0x00));   // INT 转输出
+    AW_TRY(aw9523_update_bits(dev, AW9523_REG_OUTPUT_P1,
+                              AW9523_P1_TP_RST | AW9523_P1_TP_INT, 0x00));
+    AW_TRY(aw9523_update_bits(dev, AW9523_REG_CONFIG_P1,
+                              AW9523_P1_TP_INT, 0x00));   // INT 转输出
     vTaskDelay(pdMS_TO_TICKS(20));
     // 释放 RST，INT 保持低 → 固件以 0x5D 地址干净重启（NVM 厂家配置正常加载）
-    ESP_ERROR_CHECK(aw9523_update_bits(dev, AW9523_REG_OUTPUT_P1,
-                                       AW9523_P1_TP_RST, AW9523_P1_TP_RST));
+    AW_TRY(aw9523_update_bits(dev, AW9523_REG_OUTPUT_P1,
+                              AW9523_P1_TP_RST, AW9523_P1_TP_RST));
     vTaskDelay(pdMS_TO_TICKS(50));
-    // INT 还回输入（高阻，交还 GT911 驱动）
-    ESP_ERROR_CHECK(aw9523_update_bits(dev, AW9523_REG_CONFIG_P1,
-                                       AW9523_P1_TP_INT, AW9523_P1_TP_INT));
+    // INT 还回输入（高阻，交还 GT911 驱动）。这一步即使前面失败也必须尝试，
+    // 否则 INT 会被永久钉在输出低，GT911 再也无法上报中断。
+    esp_err_t release = aw9523_update_bits(dev, AW9523_REG_CONFIG_P1,
+                                           AW9523_P1_TP_INT, AW9523_P1_TP_INT);
     vTaskDelay(pdMS_TO_TICKS(120));
-    return ESP_OK;
+    return release;
 }
 

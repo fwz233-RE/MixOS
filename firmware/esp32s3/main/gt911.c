@@ -4,6 +4,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "board_pins.h"
+#include "mix_i2c.h"
 
 static const char *TAG = "GT911";
 
@@ -17,16 +19,15 @@ static const char *TAG = "GT911";
 #define REG_STATUS      0x814E
 #define REG_POINT0      0x814F
 
+// 寄存器地址 16 位大端，统一走 mix_i2c 的宽地址助手（与其它任务串行）。
 static esp_err_t reg_read(i2c_master_dev_handle_t dev, uint16_t reg, uint8_t *buf, size_t len)
 {
-    uint8_t addr[2] = { reg >> 8, reg & 0xFF };
-    return i2c_master_transmit_receive(dev, addr, 2, buf, len, 100);
+    return mix_i2c_read_wide(dev, reg, buf, len, I2C_XFER_TIMEOUT_MS);
 }
 
 static esp_err_t reg_write_u8(i2c_master_dev_handle_t dev, uint16_t reg, uint8_t val)
 {
-    uint8_t buf[3] = { reg >> 8, reg & 0xFF, val };
-    return i2c_master_transmit(dev, buf, 3, 100);
+    return mix_i2c_write_wide_u8(dev, reg, val);
 }
 
 // ---- 通用配置表（0x8047..0x80FE，184 字节）----
@@ -75,41 +76,33 @@ static esp_err_t send_config(i2c_master_dev_handle_t dev)
     }
     buf[2 + sizeof(k_cfg)] = (uint8_t)(~sum + 1);  // checksum
     buf[3 + sizeof(k_cfg)] = 0x01;                 // config fresh
-    return i2c_master_transmit(dev, buf, sizeof(buf), 200);
+    return mix_i2c_transmit(dev, buf, sizeof(buf), I2C_BULK_TIMEOUT_MS);
 }
 
-static esp_err_t probe_addr(i2c_master_bus_handle_t bus, uint8_t addr,
-                            i2c_master_dev_handle_t *out_dev, uint8_t id[4])
+static esp_err_t probe_addr(uint8_t addr, i2c_master_dev_handle_t *out_dev, uint8_t id[4])
 {
-    i2c_device_config_t cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = addr,
-        .scl_speed_hz = 100 * 1000,
-    };
-    i2c_master_dev_handle_t dev;
-    esp_err_t err = i2c_master_bus_add_device(bus, &cfg, &dev);
-    if (err != ESP_OK) {
-        return err;
-    }
-    err = reg_read(dev, REG_PRODUCT_ID, id, 4);
+    i2c_master_dev_handle_t dev = mix_i2c_add_device(addr, I2C_STANDARD_HZ);
+    if (!dev) return ESP_ERR_NOT_FOUND;
+    esp_err_t err = reg_read(dev, REG_PRODUCT_ID, id, 4);
     if (err != ESP_OK || id[0] != '9') {
-        i2c_master_bus_rm_device(dev);
+        mix_i2c_rm_device(dev);
         return (err != ESP_OK) ? err : ESP_ERR_INVALID_RESPONSE;
     }
     *out_dev = dev;
     return ESP_OK;
 }
 
-esp_err_t gt911_init(i2c_master_bus_handle_t bus, i2c_master_dev_handle_t *out_dev)
+esp_err_t gt911_init(i2c_master_dev_handle_t *out_dev)
 {
+    /* 总线由 mix_i2c 持有，main.c 在建任何设备之前先初始化它 */
     // 复位时序 INT 拉低贯穿 → 地址 0x5D；万一时序被打断退回 0x14
     uint8_t id[4] = { 0 };
-    uint8_t addr = 0x5D;
+    uint8_t addr = GT911_I2C_ADDR_PRIMARY;
     i2c_master_dev_handle_t dev = NULL;
-    esp_err_t err = probe_addr(bus, addr, &dev, id);
+    esp_err_t err = probe_addr(addr, &dev, id);
     if (err != ESP_OK) {
-        addr = 0x14;
-        err = probe_addr(bus, addr, &dev, id);
+        addr = GT911_I2C_ADDR_ALT;
+        err = probe_addr(addr, &dev, id);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "0x5D/0x14 均无应答: %s（查 MUX_SEL / TP_RST 时序）",
                      esp_err_to_name(err));
@@ -161,7 +154,7 @@ esp_err_t gt911_init(i2c_master_bus_handle_t bus, i2c_master_dev_handle_t *out_d
         err = send_config(dev);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "配置下发失败: %s", esp_err_to_name(err));
-            i2c_master_bus_rm_device(dev);
+            mix_i2c_rm_device(dev);
             return err;
         }
         vTaskDelay(pdMS_TO_TICKS(200));
@@ -187,7 +180,7 @@ esp_err_t gt911_init(i2c_master_bus_handle_t bus, i2c_master_dev_handle_t *out_d
         }
         if (rt_x == 0) {
             // 固件异常态（常伴 Sensor_ID=0xFF）：返回错误，由上层做 recovery reset
-            i2c_master_bus_rm_device(dev);
+            mix_i2c_rm_device(dev);
             return ESP_ERR_INVALID_STATE;
         }
     }
@@ -204,14 +197,20 @@ esp_err_t gt911_raw_status(i2c_master_dev_handle_t dev, uint8_t *status)
 
 esp_err_t gt911_read(i2c_master_dev_handle_t dev, gt911_touch_t *t)
 {
+    /* 状态读 → 坐标读 → 清状态必须是一组原子操作。中间若插入别的任务的传输
+     * （键盘轮询、电池日志）甚至一次总线复位，就可能在读坐标之前把这一帧的
+     * 状态位丢掉，表现为触摸偶发丢点。 */
+    mix_i2c_lock();
     uint8_t status = 0;
     esp_err_t err = reg_read(dev, REG_STATUS, &status, 1);
     if (err != ESP_OK) {
+        mix_i2c_unlock();
         return err;
     }
     if (!(status & 0x80)) {
         // 参考 esp_lcd_touch_gt911：即使无数据也清一次状态，保持与官方驱动一致
         reg_write_u8(dev, REG_STATUS, 0);
+        mix_i2c_unlock();
         return ESP_ERR_NOT_FOUND;  // 无新数据
     }
 
@@ -220,13 +219,22 @@ esp_err_t gt911_read(i2c_master_dev_handle_t dev, gt911_touch_t *t)
         // 每个触点 8 字节：track_id, xL, xH, yL, yH, sizeL, sizeH, rsv
         uint8_t p[8] = { 0 };
         err = reg_read(dev, REG_POINT0, p, 8);
-        if (err != ESP_OK) { t->count = 0; reg_write_u8(dev, REG_STATUS, 0); return err; }
+        if (err != ESP_OK) {
+            t->count = 0;
+            reg_write_u8(dev, REG_STATUS, 0);
+            mix_i2c_unlock();
+            return err;
+        }
         t->x = p[1] | (p[2] << 8);
         t->y = p[3] | (p[4] << 8);
         if (t->count > 5 || t->x >= 1024 || t->y >= 768) {
-            t->count = 0; reg_write_u8(dev, REG_STATUS, 0); return ESP_ERR_INVALID_RESPONSE;
+            t->count = 0;
+            reg_write_u8(dev, REG_STATUS, 0);
+            mix_i2c_unlock();
+            return ESP_ERR_INVALID_RESPONSE;
         }
     }
     reg_write_u8(dev, REG_STATUS, 0);  // 清状态，准备下一帧
+    mix_i2c_unlock();
     return ESP_OK;
 }

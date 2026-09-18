@@ -5,6 +5,7 @@
  */
 
 #include <string.h>
+#include <stdatomic.h>
 #include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -72,6 +73,23 @@ typedef struct {
 } uac_device_t;
 
 static uac_device_t *s_uac_device = NULL;
+static atomic_bool s_tinyusb_initialized, s_restart_detached;
+
+bool uac_device_disconnect_for_restart(void)
+{
+    if (!atomic_load(&s_tinyusb_initialized)) return false;
+    if (atomic_exchange(&s_restart_detached, true)) return true;
+    /* Audited ESP32-S3 DWC2 implementation: tud_disconnect() synchronously
+     * calls dcd_disconnect(), which forces USB_WRAP D+/D- pull-downs and sets
+     * DCTL.SDIS. It touches no TinyUSB queues, class state or endpoint locks.
+     * The independent pad override stays disconnected even if a concurrent
+     * DCD interrupt updates DCTL. Only connect/init clears the pad override;
+     * this application never reconnects/reinitializes before the reset.
+     * Do not defer through usbd_defer_func(): its FreeRTOS queue send can wait
+     * forever. Nor may tud_deinit() tear down active CDC/audio users here. */
+    return tud_disconnect();
+}
+
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 #define UAC_ENTER_CRITICAL()    portENTER_CRITICAL(&s_mux)
 #define UAC_EXIT_CRITICAL()     portEXIT_CRITICAL(&s_mux)
@@ -553,6 +571,7 @@ esp_err_t uac_device_init(uac_device_config_t *config)
             ESP_LOGE(TAG, "USB Device Stack Init Fail");
             return ESP_FAIL;
         }
+        atomic_store(&s_tinyusb_initialized, true);
         ret_val = xTaskCreatePinnedToCore(tusb_device_task, "TinyUSB", 4096, NULL, CONFIG_UAC_TINYUSB_TASK_PRIORITY,
                                           NULL, CONFIG_UAC_TINYUSB_TASK_CORE == -1 ? tskNO_AFFINITY : CONFIG_UAC_TINYUSB_TASK_CORE);
         ESP_RETURN_ON_FALSE(ret_val == pdPASS, ESP_FAIL, TAG, "Failed to create TinyUSB task");

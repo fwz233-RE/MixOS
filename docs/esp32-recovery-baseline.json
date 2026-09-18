@@ -1,0 +1,21 @@
+{
+  "format": 1,
+  "purpose": "protected-recovery-baseline-not-a-new-release",
+  "job": "mixos-display-20260916-024325",
+  "chip": "esp32s3",
+  "mac": "70:04:1d:d8:54:14",
+  "usb_serial": "TD0720",
+  "usb_location": "5-1.2",
+  "slot": "ota_0",
+  "address": 65536,
+  "slot_bytes": 2031616,
+  "image_bytes": 894560,
+  "image_sha256": "7875d9a513acb95463b72e785ebd160c70d03f85e965c3a30a93d954bb4cff5f",
+  "elf_sha256": "cfacb3fe25931e918b8f46d1f840da8d57ba39ef799bd0af4629939b9185761a",
+  "state": "valid",
+  "backup_sha256": "fa7eacf1b20d193443d717620487eee2aa52f71e8943f49eb69590f6d4814886",
+  "readback_sha256": "df9c108f6248f2cfde22f097187beaeef5d76dbfd34a173140671c164939a73e",
+  "readback_evidence": "build/deploy/recovery-20260916-024325-readback-verification.json",
+  "boot_evidence": "build/deploy/recovery-20260916-024325-boot-verification.json",
+  "release_guard": "Explicit release only after a replacement in ota_1 is VALID and independently verified. Two slots cannot preserve this image forever while alternating updates."
+}

@@ -21,6 +21,11 @@ import idf_env  # noqa: E402
 
 APP = ROOT / "firmware/esp32s3/build/mixos_esp32s3.bin"
 DEST = ROOT / "build/esp32s3"
+# Recovery artifacts always remain in the original protected directory, even
+# when a new candidate and its reports use isolated output directories.
+PRESERVED = DEST
+BUILD_DIR = None
+BUILD_COMMAND = 'py -3.12 tests/esp_font_build.py build'
 OLD_SHA = "9593904eab8c1bcaaef9c383abc9a5308ae4beeece94989436360289eafc675b"
 OLD_BYTES = 469104
 CANDIDATE_SHA = "c0e99db4d5cb854e5ea2bf24753fcfb17ef77f8bce7b3b1c6a20b824418e2a69"
@@ -29,8 +34,8 @@ CANDIDATE_BYTES = 857136
 
 def preserve_candidate():
     """Keep the prior font-enabled candidate separately from deployed recovery."""
-    DEST.mkdir(parents=True, exist_ok=True)
-    saved = DEST / "previous-font-candidate-mixos_esp32s3.bin"
+    PRESERVED.mkdir(parents=True, exist_ok=True)
+    saved = PRESERVED / "previous-font-candidate-mixos_esp32s3.bin"
     if not saved.exists():
         for source in (APP, DEST / "mixos_esp32s3.bin"):
             record = info(source)
@@ -51,8 +56,8 @@ def info(path):
 
 
 def preserve():
-    DEST.mkdir(parents=True, exist_ok=True)
-    previous = DEST / "previous-mixos_esp32s3.bin"
+    PRESERVED.mkdir(parents=True, exist_ok=True)
+    previous = PRESERVED / "previous-mixos_esp32s3.bin"
     if previous.exists():
         record = info(previous)
         if record["sha256"] != OLD_SHA or record["bytes"] != OLD_BYTES:
@@ -89,7 +94,49 @@ def app_slot():
             "table": info(table)}
 
 
+def input_records():
+    project = ROOT / 'firmware/esp32s3'
+    sources = [info(path) for path in sorted((project / 'main').iterdir())
+               if path.suffix in ('.c', '.h') or path.name in ('CMakeLists.txt', 'idf_component.yml')]
+    inputs = [info(project / name) for name in
+              ('sdkconfig', 'sdkconfig.defaults', 'partitions.csv', 'CMakeLists.txt', 'dependencies.lock')]
+    components = [dict(info(path), component_path=path.relative_to(project).as_posix())
+                  for path in sorted((project / 'components').rglob('*'))
+                  if path.is_file() and (path.suffix in ('.c', '.h', '.cpp', '.cc', '.S', '.s', '.ld', '.cmake')
+                      or path.name in ('CMakeLists.txt', 'idf_component.yml', 'sdkconfig.defaults')
+                      or path.name.startswith('Kconfig'))]
+    return {'sources': sources, 'build_inputs': inputs, 'component_sources': components}
+
+
+def artifact_records():
+    return {name: info(path) for name, path in {
+        'build_app': APP, 'elf': APP.with_suffix('.elf'),
+        'partition_table': APP.parent / 'partition_table/partition-table.bin',
+        'sdkconfig_generated': APP.parent / 'config/sdkconfig.json',
+    }.items()}
+
+
+def attest_build(before):
+    after = input_records()
+    if before != after:
+        raise RuntimeError('Build inputs changed during compilation; run a stable incremental build before release')
+    receipt = {'schema': 'mixos-local-build/v1', 'inputs': after, 'artifacts': artifact_records()}
+    (DEST / 'completed-build.json').write_text(json.dumps(receipt, indent=2) + '\n', encoding='utf-8')
+
+
+def checked_attestation():
+    path = DEST / 'completed-build.json'
+    if not path.exists():
+        raise RuntimeError('No stable completed-build receipt; run the build driver, not report alone')
+    receipt = json.loads(path.read_text(encoding='utf-8'))
+    if (receipt.get('schema') != 'mixos-local-build/v1' or
+            receipt.get('inputs') != input_records() or receipt.get('artifacts') != artifact_records()):
+        raise RuntimeError('Completed-build inputs or artifacts changed; rebuild before reporting')
+    return info(path)
+
+
 def report():
+    attestation = checked_attestation()
     previous = preserve()
     previous_candidate = preserve_candidate()
     current = info(APP)
@@ -98,25 +145,30 @@ def report():
         raise RuntimeError("Application did not change")
     if current["bytes"] > slot["bytes"] or APP.read_bytes()[0] != 0xE9:
         raise RuntimeError("App image signature/partition size validation failed")
-    wsl_base = posix_path(ROOT)
     paths = idf_env.idf_paths(ROOT)
     image = subprocess.check_output(host_command([
         paths["python"], "-m", "esptool",
         "--chip", "esp32s3", "image_info",
-        wsl_base + "/firmware/esp32s3/build/mixos_esp32s3.bin"]), text=True)
+        posix_path(APP)]), text=True)
     if "Checksum:" not in image or "Validation Hash:" not in image or image.count("(valid)") != 2:
         raise RuntimeError("esptool did not validate the application checksum and embedded hash")
     symbols = subprocess.check_output(host_command([
         paths["compiler_bin"] + "/xtensa-esp32s3-elf-nm",
-        "--defined-only", wsl_base + "/firmware/esp32s3/build/mixos_esp32s3.elf"]), text=True)
+        "--defined-only", posix_path(APP.with_suffix('.elf'))]), text=True)
     expected = {"ttf_font_init", "ttf_font_deinit", "ttf_draw_cell", "FT_New_Memory_Face"}
     linked = [line for line in symbols.splitlines() if line.split()[-1:] and line.split()[-1] in expected]
     if {line.split()[-1] for line in linked} != expected:
         raise RuntimeError("Required font entry points are absent from linked ELF")
     copy = DEST / "mixos_esp32s3.bin"
     copy.write_bytes(APP.read_bytes())
-    sources = [info(ROOT / "firmware/esp32s3/main" / name)
-               for name in ("main.c", "ttf_font.c", "ttf_font.h", "mix_ui.c", "mix_link.c")]
+    sources = [info(path) for path in sorted((ROOT / 'firmware/esp32s3/main').iterdir())
+               if path.suffix in ('.c', '.h') or path.name in ('CMakeLists.txt', 'idf_component.yml')]
+    build_inputs = [info(ROOT / 'firmware/esp32s3' / name)
+                    for name in ('sdkconfig', 'sdkconfig.defaults', 'partitions.csv', 'CMakeLists.txt', 'dependencies.lock')]
+    build_config = json.loads((APP.parent / 'config/sdkconfig.json').read_text(encoding='utf-8'))
+    effective_config = {'CONFIG_' + key: value for key, value in build_config.items()}
+    rtc_layout = [line for line in symbols.splitlines()
+                  if line.split()[-1:] and line.split()[-1] in ('mix_ota_rtc_diagnostics', 'retained')]
     manifest_path = ROOT / "build/font/MiSans-Normal-gb2312.ttf.manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     ui_bytes = (ROOT / "firmware/esp32s3/main/mix_ui.c").read_bytes()
@@ -136,18 +188,49 @@ def report():
               "partition_table": slot["table"],
               "ota_capable": slot["layout"] == "ab",
               "image_validation": image, "linked_font_symbols": linked,
-              "sources": sources,
-              "build_command": "py -3.12 tests/esp_font_build.py build",
+              'build_attestation': attestation,
+              "sources": sources, "build_inputs": build_inputs,
+              "component_sources": input_records()['component_sources'],
+              "effective_config": effective_config, "rtc_diagnostic_symbols": rtc_layout,
+              "sdkconfig": info(ROOT / 'firmware/esp32s3/sdkconfig'),
+              "sdkconfig_generated": info(APP.parent / 'config/sdkconfig.json'),
+              "elf": info(APP.with_suffix('.elf')),
+              "build_command": BUILD_COMMAND,
               "build_log": info(DEST / "font-app-build.log"),
               "hardware_validation": "not performed; no SSH or flashing"}
+    if checked_attestation() != attestation:
+        raise RuntimeError('Build receipt changed during report generation')
     (DEST / "font-app-build.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(record, indent=2))
+
+
+def isolated_paths(build_dir, report_dir):
+    """Reject overlapping or protected outputs before invoking the compiler."""
+    build_dir, report_dir = Path(build_dir).resolve(), Path(report_dir).resolve()
+    protected = ((ROOT / 'firmware/esp32s3/build').resolve(), PRESERVED.resolve())
+    def overlaps(left, right):
+        return left == right or left in right.parents or right in left.parents
+    if (overlaps(build_dir, report_dir) or
+            any(overlaps(path, base) for path in (build_dir, report_dir) for base in protected)):
+        raise ValueError('isolated build/report directories must preserve the original outputs')
+    return build_dir, report_dir
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=("preserve", "build", "report"))
+    parser.add_argument('--build-dir', type=Path, help='isolated candidate output; requires --report-dir')
+    parser.add_argument('--report-dir', type=Path, help='isolated build reports; requires --build-dir')
     args = parser.parse_args()
+    if (args.build_dir is None) != (args.report_dir is None):
+        parser.error('--build-dir and --report-dir must be specified together')
+    if args.build_dir is not None:
+        try:
+            BUILD_DIR, DEST = isolated_paths(args.build_dir, args.report_dir)
+        except ValueError as exc:
+            parser.error(str(exc))
+        APP = BUILD_DIR / 'mixos_esp32s3.bin'
+        BUILD_COMMAND += ' --build-dir ' + str(BUILD_DIR) + ' --report-dir ' + str(DEST)
     if args.stage == "preserve":
         preserve()
         preserve_candidate()
@@ -156,11 +239,13 @@ if __name__ == "__main__":
     else:
         preserve()
         preserve_candidate()
-        result = subprocess.run(host_command(["bash", "-lc", idf_env.build_command(ROOT)]),
+        before = input_records()
+        result = subprocess.run(host_command(["bash", "-lc", idf_env.build_command(ROOT, BUILD_DIR)]),
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         DEST.mkdir(parents=True, exist_ok=True)
         (DEST / "font-app-build.log").write_bytes(result.stdout)
         print(result.stdout.decode("utf-8", errors="replace"))
         if result.returncode:
             raise SystemExit(result.returncode)
+        attest_build(before)
         report()

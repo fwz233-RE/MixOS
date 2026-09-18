@@ -1,0 +1,65 @@
+[Unit]
+Description=MixOS language model runtime (litert-lm)
+Documentation=file:///opt/mixos/docs/AI_DECK.md
+After=network.target
+# The translator backend proxies into this; starting them in the wrong order
+# only means the first request waits, so this is a want rather than a require.
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi
+Environment=HOME=/home/pi
+# The device cannot reach Hugging Face on this network, and must not try: a
+# blocked request is a two-minute stall, not an error. Models arrive through
+# tools/deploy_models.py and are imported locally.
+Environment=HF_HUB_OFFLINE=1
+Environment=TRANSFORMERS_OFFLINE=1
+ExecStart=/home/pi/mixos-ai/venv/bin/litert-lm serve --port 9379
+Restart=on-failure
+RestartSec=5
+# No memory ceiling, deliberately. See the same note in mixos-aiserver.service.
+#
+# MemoryMax=2600M, MemorySwapMax=1500M and OOMPolicy=stop were here until
+# 2026-09-14. They were inert - this kernel boots with `cgroup_disable=memory`,
+# so no memory controller exists for them to be written into - and once measured
+# they were also unnecessary.
+#
+# This process is the cheap half, which is the opposite of what the project
+# assumed. litert-lm maps model.litertlm rather than reading it: 2468 MiB on disk,
+# and only 285 MiB of that resident at any moment. Peak resident is 1553 MiB and
+# only 419 MiB of it is anonymous - a model four times the size of all the speech
+# models together, costing a quarter of what they cost, because it never copies
+# its weights out of the file.
+#
+# Restart=on-failure above covers the kernel OOM killer, and OOMPolicy=continue
+# is what allows that restart to happen: this system defaults to
+# DefaultOOMPolicy=stop, which would take the service down and ignore Restart=.
+# See the fuller note in mixos-aiserver.service.
+OOMPolicy=continue
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# /home/pi/.litert-lm/models is where `litert-lm import` put the model, and it
+# is also where the runtime writes its XNNPack weight cache. Leaving it
+# read-only did not fail the request - it made every cold start repeat the
+# 32-second engine initialisation, because the cache could neither be written
+# nor, next time, read:
+#   ERROR: could not open file ('.../model.litertlm.xnnpack_cache_...'):
+#   Read-only file system.
+ReadWritePaths=/home/pi/mixos-ai /home/pi/.cache /home/pi/.litert-lm
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+# It listens on loopback for the translator backend and nothing else.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressAllow=localhost
+IPAddressDeny=any
+
+[Install]
+WantedBy=multi-user.target

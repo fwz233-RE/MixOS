@@ -1,6 +1,6 @@
 # ESP32-S3 font initialization and terminal rendering build report
 
-The subsequent host-authorized update firmware build is documented in `ESP_HOST_UPDATE.md`. Its current application replaces the candidate below; the candidate and deployed recovery image are both preserved separately. The historical font-rendering results below remain applicable.
+本页保存早期字体渲染构建证据，镜像大小与布局数值属于当时版本。2026-09-16 的更新安全实现见 `ESP_OTA_V2.md`：字体初始化失败已改为试运行复位或已确认镜像的 USB 维护模式，不再仅记录警告后继续正常启动。下文栅格化、字体内容与历史测试结果保留，不作为当前候选已部署的证明。
 
 ## Scope and implemented changes
 

@@ -58,14 +58,14 @@ def prepare_esptool(wheel):
     esp.audit('isolated_esptool_verified', sha256=WHEEL_SHA256, version=ESPTOOL_VERSION)
 
 
-def enter_download_direct(dev, identity):
+def enter_download_direct(dev, identity, *, open_port=None):
     """An explicit host execute command authorizes the new firmware's grant.
 
     Never synthesizes local touch/keys. Older firmware requiring a local grant
     fails closed here; its ROM can instead be entered using hardware recovery.
     """
     from update_esp import Maintenance
-    with esp.open_port(dev) as port:
+    with (open_port or esp.open_port)(dev) as port:
         if physical_identity(dev) != identity:
             raise RuntimeError('Application identity changed')
         state = Maintenance()
@@ -466,11 +466,17 @@ def session(dev, identity, payload, table, app, new_app=None, bootloader=None, r
         chip.flash_set_parameters(FLASH_SIZE)
         esp.audit('font_flash_parameters_ready')
         before = read_full_flash(chip, 'backup')
-        validate_backup(before, table, app, migrate)
+        # The backup is the recovery path, so it becomes durable before anything
+        # is allowed to reject it. Validating first meant a refused image also
+        # discarded the only copy of what the device currently holds, and the
+        # next attempt had to re-read all 8 MiB to reach the same point. Writing
+        # it early cannot make a bad image acceptable: the checks below still run
+        # before any write, and a saved backup is exactly what a refusal needs.
         backup = esp.ROOT / 'original-flash-8MB.bin'
         durable_new(backup, before)
         durable_new(esp.ROOT / 'original-flash-8MB.bin.sha256',
                     (sha(before) + '  original-flash-8MB.bin\n').encode())
+        validate_backup(before, table, app, migrate)
         esp.audit('font_backup_verified', file=str(backup), bytes=len(before), sha256=sha(before), flash_id=flash_id)
         if physical_identity(dev) != identity:
             raise RuntimeError('ROM identity changed before write')

@@ -2,6 +2,7 @@
 import unittest
 
 from _support import ROOT, host_run, posix_path, require_host_cc
+from _ota_sdk_stubs import HEADERS as OTA_HEADERS
 
 OUT = ROOT / "build/host-link-update"
 HEADERS = {
@@ -17,9 +18,16 @@ HEADERS = {
     "freertos/task.h": "#pragma once\nvoid vTaskDelay(unsigned);\nint xTaskCreate(void (*)(void*),const char*,unsigned,void*,unsigned,void*);\n",
     "freertos/queue.h": "#pragma once\n#include <stddef.h>\ntypedef struct test_queue *QueueHandle_t;\nQueueHandle_t xQueueCreate(unsigned,size_t);\nint xQueueSend(QueueHandle_t,const void*,unsigned);\nint xQueueReceive(QueueHandle_t,void*,unsigned);\nvoid xQueueReset(QueueHandle_t);\n",
     "esp_random.h": "#pragma once\n#include <stdint.h>\nuint32_t esp_random(void);\n",
-    "cJSON.h": "#pragma once\n#include <stddef.h>\ntypedef struct {double valuedouble;} cJSON;\ncJSON *cJSON_ParseWithLength(const char*,size_t);\ncJSON *cJSON_GetObjectItemCaseSensitive(cJSON*,const char*);\nint cJSON_IsNumber(const cJSON*);\nvoid cJSON_Delete(cJSON*);\n",
+    "cJSON.h": "#pragma once\n#include <stddef.h>\ntypedef struct {double valuedouble;char *valuestring;} cJSON;\n"
+               "cJSON *cJSON_ParseWithLength(const char*,size_t);\n"
+               "cJSON *cJSON_GetObjectItemCaseSensitive(cJSON*,const char*);\n"
+               "int cJSON_IsNumber(const cJSON*);\nint cJSON_IsString(const cJSON*);\n"
+               "int cJSON_IsObject(const cJSON*);\nint cJSON_IsTrue(const cJSON*);\n"
+               "void cJSON_Delete(cJSON*);\n",
     "tusb.h": "#pragma once\n#include <stdbool.h>\n#include <stdint.h>\nbool tud_cdc_connected(void);\nbool tud_mounted(void);\nuint32_t tud_cdc_read(void*,uint32_t);\nuint32_t tud_cdc_write(const void*,uint32_t);\nvoid tud_cdc_write_flush(void);\n",
 }
+HEADERS.update({name: OTA_HEADERS[name] for name in ('esp_timer.h', 'esp_task_wdt.h', 'freertos/task.h', 'freertos/queue.h')})
+HEADERS['esp_lcd_panel_ops.h'] = '#pragma once\ntypedef void *esp_lcd_panel_handle_t;\n'
 
 
 def linux(path):
@@ -76,9 +84,27 @@ class LinkUpdateTests(unittest.TestCase):
     def test_queue_failure_never_grants(self):
         self.scenario("queue")
 
+    def test_switching_applications_ends_the_previous_one(self):
+        """Pressing a different launcher card has to replace the session.
+
+        The host answers a second OPEN with 'terminal already open', so a link
+        that quietly reported success left the old application on screen under
+        the new one's title.
+        """
+        self.scenario("switch")
+
     def test_ota_transfer_resync_refusal_and_teardown(self):
         """The in-protocol A/B update: the path that removes esptool reflashing."""
         self.scenario("ota")
+
+    def test_identify_answers_after_a_fresh_link(self):
+        """Which build is running has to be answerable, not inferred.
+
+        A build the bootloader rolled back re-enumerates over USB and completes
+        the handshake identically to the build that was just installed, so
+        every other signal the updater has looks the same either way.
+        """
+        self.scenario("identify")
 
 
 if __name__ == "__main__":

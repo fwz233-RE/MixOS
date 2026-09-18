@@ -15,7 +15,9 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'linux'))
 from protocol import Frame, Decoder, Channel as C, Type as T
-from mixosd import Link, WriteQueue, QueueFull, PtyShell, HashJob, HostMetrics, open_serial
+from mixosd import (Link, WriteQueue, QueueFull, PtyShell, HashJob, HostMetrics,
+                    open_serial, resolve_app, APP_NAMES)
+import netctl
 import headless
 
 spec = importlib.util.spec_from_file_location('update_esp', ROOT / 'tools' / 'update_esp.py')
@@ -24,8 +26,9 @@ spec.loader.exec_module(update)
 
 
 class FakeShell:
-    def __init__(self, cols, rows):
+    def __init__(self, cols, rows, app='shell'):
         self.dimensions = cols, rows
+        self.app = app
         self.closed = False
 
     def resize(self, cols, rows):
@@ -33,6 +36,40 @@ class FakeShell:
 
     def close(self):
         self.closed = True
+
+
+class FakeNet:
+    """Stands in for the helper subprocess: nothing is spawned in these tests."""
+
+    def __init__(self):
+        self.started = []
+        self.pending = None
+        self.answers = {}
+        self.closed = 0
+
+    def busy(self):
+        return self.pending is not None
+
+    def start(self, kind, session, request, timeout):
+        if self.pending is not None:
+            return False
+        self.started.append((kind, session, request, timeout))
+        self.pending = (kind, session)
+        return True
+
+    def finish(self, answer):
+        self.answers[self.pending] = answer
+
+    def poll(self):
+        if self.pending is None or self.pending not in self.answers:
+            return None
+        key = self.pending
+        self.pending = None
+        return key[0], key[1], self.answers.pop(key)
+
+    def close(self):
+        self.pending = None
+        self.closed += 1
 
 
 def drain(queue):
@@ -77,7 +114,7 @@ class QueueTests(unittest.TestCase):
 class LinkTests(unittest.TestCase):
     def setUp(self):
         self.now = 0.0
-        self.link = Link(FakeShell, clock=lambda: self.now)
+        self.link = Link(FakeShell, clock=lambda: self.now, net=FakeNet())
         self.seq = 1
         self.epoch = 123
         self.send(C.CONTROL, T.HELLO, payload=struct.pack('<HH', 512, 4096))
@@ -244,7 +281,363 @@ class LinkTests(unittest.TestCase):
 
     def test_missing_metrics_are_null(self):
         with patch.object(Path, 'read_text', side_effect=OSError('unavailable')):
-            self.assertTrue(all(v is None for v in HostMetrics().sample().values()))
+            sample = HostMetrics().sample()
+        measured = ('uptime_s', 'cpu_pct', 'mem_used_kib', 'mem_total_kib', 'temp_c')
+        self.assertTrue(all(sample[key] is None for key in measured))
+        # An unreported radio is absent from the report, never a fabricated
+        # "disconnected" or "0%".
+        self.assertNotIn('wifi', sample)
+        self.assertNotIn('ip', sample)
+
+    def test_network_report_only_appears_once_the_host_answers(self):
+        metrics = HostMetrics()
+        self.assertNotIn('wifi', metrics.sample())
+        metrics.report_network({'connected': True, 'ssid': 'lab', 'signal': 71}, '10.0.0.5')
+        sample = metrics.sample()
+        self.assertEqual(sample['wifi'], {'connected': True, 'ssid': 'lab', 'signal': 71})
+        self.assertEqual(sample['ip'], '10.0.0.5')
+        # A later failed query withdraws the claim rather than freezing the old one.
+        metrics.report_network(None, '')
+        self.assertNotIn('wifi', metrics.sample())
+
+    def test_clock_is_always_reported(self):
+        sample = HostMetrics().sample()
+        self.assertIsInstance(sample['time_s'], int)
+        self.assertTrue(-1440 <= sample['tz_offset_min'] <= 1440)
+
+
+class ApplicationTests(unittest.TestCase):
+    """The launcher accepts four names and nothing else."""
+
+    def setUp(self):
+        self.now = 0.0
+        self.net = FakeNet()
+        self.link = Link(FakeShell, clock=lambda: self.now, net=self.net)
+        self.seq = 1
+        self.epoch = 77
+        self.send(C.CONTROL, T.HELLO, payload=struct.pack('<HH', 512, 4096))
+        drain(self.link.tx)
+
+    def send(self, channel, kind, session=0, payload=b''):
+        frame = Frame(channel, kind, self.epoch, session, self.seq, payload)
+        self.seq += 1
+        self.link.feed(frame.encode())
+        return frame
+
+    def open_app(self, name, cols=80, rows=28):
+        payload = struct.pack('<HH', cols, rows)
+        if name is not None:
+            encoded = name.encode('utf-8')
+            payload += bytes([len(encoded)]) + encoded
+        self.send(C.TERMINAL, T.OPEN, 7, payload)
+        return drain(self.link.tx)
+
+    def test_each_allowed_application_starts(self):
+        for name in APP_NAMES:
+            with self.subTest(app=name):
+                self.setUp()
+                frames = self.open_app(name)
+                self.assertEqual(frames[0].type, T.OPENED)
+                # OPENED echoes only the geometry, so the device compares the
+                # number it asked for and nothing else.
+                self.assertEqual(frames[0].payload, struct.pack('<HH', 80, 28))
+                self.assertEqual(self.link.shell.app, name)
+
+    def test_geometry_only_request_still_means_the_shell(self):
+        frames = self.open_app(None)
+        self.assertEqual(frames[0].type, T.OPENED)
+        self.assertEqual(self.link.shell.app, 'shell')
+
+    def test_unknown_application_is_refused_without_starting_anything(self):
+        for name in ('bash', 'translate ', 'Translate', '../../bin/sh', 'notes\x00'):
+            with self.subTest(app=name):
+                self.setUp()
+                frames = self.open_app(name)
+                self.assertEqual(frames[0].type, T.ERROR)
+                self.assertIsNone(self.link.shell)
+                self.assertEqual(self.link.session, 0)
+
+    def test_malformed_identifier_is_refused(self):
+        # Length byte that disagrees with the payload it describes.
+        self.send(C.TERMINAL, T.OPEN, 7, struct.pack('<HH', 80, 28) + b'\x09notes')
+        frames = drain(self.link.tx)
+        self.assertEqual(frames[0].type, T.ERROR)
+        self.assertIsNone(self.link.shell)
+
+    def test_alternate_geometry_is_accepted_and_echoed(self):
+        frames = self.open_app('notes', cols=64, rows=22)
+        self.assertEqual(frames[0].type, T.OPENED)
+        self.assertEqual(frames[0].payload, struct.pack('<HH', 64, 22))
+        self.assertEqual(self.link.shell.dimensions, (64, 22))
+
+    def test_switching_applications_replaces_the_running_one(self):
+        """A new session id asking to open means the person changed application.
+
+        Answering that with 'terminal already open' is what left the notes
+        editor running under a "live translation" heading: the screen had
+        already moved on, and the only program with a pseudo-terminal was the
+        old one. Exactly one application is alive at any time.
+        """
+        self.open_app('notes')
+        first = self.link.shell
+        self.assertEqual(self.link.session, 7)
+
+        payload = struct.pack('<HH', 80, 28) + b'\x09translate'
+        self.send(C.TERMINAL, T.OPEN, 8, payload)
+        frames = drain(self.link.tx)
+        self.assertEqual([f.type for f in frames], [T.OPENED])
+        self.assertEqual(frames[0].session, 8)
+        self.assertTrue(first.closed)
+        self.assertIsNot(self.link.shell, first)
+        self.assertEqual(self.link.shell.app, 'translate')
+        self.assertEqual(self.link.session, 8)
+
+    def test_reopening_the_same_session_is_still_refused(self):
+        """Only a *different* session id means "switch"; a repeat is a mistake."""
+        self.open_app('notes')
+        shell = self.link.shell
+        self.send(C.TERMINAL, T.OPEN, 7, struct.pack('<HH', 80, 28) + b'\x09translate')
+        frames = drain(self.link.tx)
+        self.assertEqual(frames[0].type, T.ERROR)
+        self.assertIn(b'already open', frames[0].payload)
+        self.assertIs(self.link.shell, shell)
+        self.assertFalse(shell.closed)
+
+    def test_a_refused_switch_leaves_the_old_application_running(self):
+        """Bad geometry and unknown names are refused before anything closes."""
+        self.open_app('notes')
+        shell = self.link.shell
+        self.send(C.TERMINAL, T.OPEN, 8, struct.pack('<HH', 0, 28) + b'\x09translate')
+        self.assertEqual(drain(self.link.tx)[0].type, T.ERROR)
+        self.assertIs(self.link.shell, shell)
+        self.assertFalse(shell.closed)
+        self.send(C.TERMINAL, T.OPEN, 9, struct.pack('<HH', 80, 28) + b'\x04bash')
+        self.assertEqual(drain(self.link.tx)[0].type, T.ERROR)
+        self.assertIs(self.link.shell, shell)
+        self.assertFalse(shell.closed)
+        self.assertEqual(self.link.session, 7)
+
+    def test_resolve_app_never_leaves_the_application_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            program = Path(directory) / 'notes'
+            program.write_text('#!/bin/sh\n')
+            program.chmod(0o755)
+            self.assertEqual(resolve_app('notes', '/bin/sh', directory), [str(program)])
+            self.assertEqual(resolve_app('shell', '/bin/sh', directory), ['/bin/sh', '-i'])
+            # A name outside the table can never become a path.
+            for bad in ('../sh', '/bin/sh', 'nope'):
+                with self.assertRaises(ValueError):
+                    resolve_app(bad, '/bin/sh', directory)
+            # An allow-listed name that is not installed is an error, not a
+            # silent fallback to some other program.
+            with self.assertRaises(ValueError):
+                resolve_app('translate', '/bin/sh', directory)
+
+    def test_pty_shell_requires_an_absolute_program(self):
+        with self.assertRaises(ValueError):
+            PtyShell(80, 28, ['sh'])
+        with self.assertRaises(ValueError):
+            PtyShell(80, 28, [])
+
+
+class NetworkChannelTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 0.0
+        self.net = FakeNet()
+        self.link = Link(FakeShell, clock=lambda: self.now, net=self.net)
+        self.seq = 1
+        self.epoch = 91
+        self.send(C.CONTROL, T.HELLO, payload=struct.pack('<HH', 512, 4096))
+        drain(self.link.tx)
+
+    def send(self, channel, kind, session=0, payload=b''):
+        frame = Frame(channel, kind, self.epoch, session, self.seq, payload)
+        self.seq += 1
+        self.link.feed(frame.encode())
+        return frame
+
+    @staticmethod
+    def pack(*values):
+        out = bytearray()
+        for value in values:
+            data = value.encode('utf-8')
+            out += bytes([len(data)]) + data
+        return bytes(out)
+
+    def test_scan_runs_out_of_line_and_returns_a_packed_list(self):
+        self.send(C.NET, T.NET_SCAN, 5)
+        # Nothing is answered inline: the helper has not finished yet.
+        self.assertEqual(drain(self.link.tx), [])
+        self.assertEqual(self.net.started[0][0], T.NET_SCAN)
+        self.net.finish({'ok': True, 'networks': [
+            {'ssid': 'lab', 'signal': 80, 'secured': True, 'known': True},
+            {'ssid': 'guest', 'signal': 40, 'secured': False, 'known': False}]})
+        self.link.tick()
+        frames = drain(self.link.tx)
+        listing = [f for f in frames if f.channel == C.NET]
+        self.assertEqual(listing[0].type, T.NET_LIST)
+        self.assertEqual(listing[0].payload[0], 2)
+        self.assertIn(b'lab', listing[0].payload)
+        self.assertIn(b'guest', listing[0].payload)
+
+    def test_connect_passes_the_passphrase_only_through_the_helper_request(self):
+        self.send(C.NET, T.NET_CONNECT, 6, self.pack('lab', 'hunter2'))
+        kind, session, request, _timeout = self.net.started[0]
+        self.assertEqual((kind, session), (T.NET_CONNECT, 6))
+        self.assertEqual(request, {'verb': 'connect', 'ssid': 'lab', 'passphrase': 'hunter2'})
+        self.net.finish({'ok': True, 'message': 'connected to lab'})
+        self.link.tick()
+        answer = [f for f in drain(self.link.tx) if f.channel == C.NET][0]
+        self.assertEqual(answer.type, T.NET_RESULT)
+        self.assertEqual(answer.payload[0], 0)
+        self.assertIn(b'connected to lab', answer.payload)
+
+    def test_failed_request_reports_the_reason_with_a_nonzero_code(self):
+        self.send(C.NET, T.NET_CONNECT, 8, self.pack('lab', 'bad'))
+        self.net.finish({'ok': False, 'error': 'Secrets were required, but not provided'})
+        self.link.tick()
+        answer = [f for f in drain(self.link.tx) if f.channel == C.NET][0]
+        self.assertEqual(answer.type, T.NET_RESULT)
+        self.assertEqual(answer.payload[0], 1)
+        self.assertIn(b'Secrets were required', answer.payload)
+
+    def test_second_request_is_refused_while_one_is_running(self):
+        self.send(C.NET, T.NET_SCAN, 5)
+        drain(self.link.tx)
+        self.send(C.NET, T.NET_CONNECT, 6, self.pack('lab', 'pw'))
+        answer = [f for f in drain(self.link.tx) if f.channel == C.NET][0]
+        self.assertEqual(answer.type, T.NET_RESULT)
+        self.assertEqual(answer.payload[0], 1)
+        self.assertEqual(len(self.net.started), 1)
+
+    def test_background_state_refresh_never_delays_a_user_request(self):
+        # The idle link starts its own state query.
+        self.link.tick()
+        self.assertEqual(self.net.started[0][0], 'state')
+        # While that runs, a user scan is refused rather than queued behind it,
+        # so the device sees an immediate answer instead of an unexplained wait.
+        self.send(C.NET, T.NET_SCAN, 5)
+        answer = [f for f in drain(self.link.tx) if f.channel == C.NET][0]
+        self.assertEqual(answer.payload[0], 1)
+        # A finished state query updates the metrics without emitting a frame.
+        self.net.finish({'ok': True, 'state': {'connected': True, 'ssid': 'lab', 'signal': 60},
+                         'ip': '10.0.0.9'})
+        self.link.tick()
+        self.assertEqual([f for f in drain(self.link.tx) if f.channel == C.NET], [])
+        self.assertEqual(self.link.metrics.sample()['wifi']['ssid'], 'lab')
+
+    def test_unsupported_network_type_is_refused(self):
+        self.send(C.NET, T.NET_LIST, 5)
+        answer = drain(self.link.tx)[0]
+        self.assertEqual(answer.type, T.ERROR)
+        self.assertEqual(self.net.started, [])
+
+    def test_link_reset_stops_a_running_helper(self):
+        self.send(C.NET, T.NET_SCAN, 5)
+        self.link.reset()
+        self.assertEqual(self.net.closed, 1)
+        self.assertFalse(self.net.busy())
+
+
+class NetctlTests(unittest.TestCase):
+    """The nmcli wrapper never builds a command string and never guesses."""
+
+    def test_terse_fields_survive_a_colon_in_the_name(self):
+        entries = list(netctl._split(r'80:WPA2:*:my\:network'))
+        self.assertEqual(entries, ['80', 'WPA2', '*', 'my:network'])
+
+    def test_scan_merges_duplicates_and_sorts_by_signal(self):
+        listing = '\n'.join([
+            '40:WPA2: :lab',
+            '80:WPA2:*:lab',      # same network, stronger radio
+            '55::  :open',
+        ])
+        # A saved connection reports nmcli's connection type, not the device type.
+        profiles = '802-11-wireless:lab\n802-3-ethernet:wired'
+        with patch.object(netctl, '_run', side_effect=[listing, profiles]):
+            found = netctl.scan(rescan=False)
+        self.assertEqual([e['ssid'] for e in found], ['lab', 'open'])
+        self.assertEqual(found[0]['signal'], 80)
+        self.assertTrue(found[0]['secured'])
+        self.assertTrue(found[0]['known'])
+        self.assertFalse(found[1]['secured'])
+        self.assertFalse(found[1]['known'])
+
+    def test_hidden_networks_are_dropped_rather_than_shown_blank(self):
+        with patch.object(netctl, '_run', side_effect=['70:WPA2: :', '802-11-wireless:other']):
+            self.assertEqual(netctl.scan(rescan=False), [])
+
+    def test_connect_builds_an_argument_vector_with_no_shell(self):
+        calls = []
+
+        def fake_run(args, timeout):
+            calls.append(args)
+            # The device query is the only call that returns anything useful here.
+            return 'wifi:wlan0' if args[-1] == 'device' else ''
+
+        with patch.object(netctl, '_run', side_effect=fake_run):
+            netctl.connect('lab', 'p a s s')
+        connect_call = [c for c in calls if 'connect' in c][0]
+        self.assertEqual(connect_call,
+                         ['device', 'wifi', 'connect', 'lab', 'password', 'p a s s',
+                          'ifname', 'wlan0'])
+
+    def test_rejected_inputs_never_reach_nmcli(self):
+        with patch.object(netctl, '_run') as run:
+            for ssid in ('', 'x' * 33, 'bad\nname'):
+                with self.assertRaises(netctl.NetError):
+                    netctl.connect(ssid, 'pw')
+            with self.assertRaises(netctl.NetError):
+                netctl.connect('lab', 'x' * 64)
+            with self.assertRaises(netctl.NetError):
+                netctl.connect('lab', 'pw\n--rescan')
+            run.assert_not_called()
+
+    def test_authorisation_failure_is_explained_not_escalated(self):
+        message = netctl._reason('Error: Not authorized to control networking.', 4)
+        self.assertIn('netdev', message)
+
+    def test_packed_scan_fits_one_frame_and_drops_rather_than_truncates(self):
+        entries = [{'ssid': 'n' * 32, 'signal': 90, 'secured': True, 'known': False}
+                   for _ in range(netctl.SCAN_MAX)]
+        packed = netctl.pack_scan(entries)
+        self.assertLessEqual(len(packed), netctl.FRAME_LIMIT)
+        self.assertEqual(packed[0], netctl.SCAN_MAX)
+        at = 1
+        for _ in range(packed[0]):
+            flags, signal, length = packed[at], packed[at + 1], packed[at + 2]
+            self.assertEqual(flags, 1)
+            self.assertEqual(signal, 90)
+            self.assertEqual(length, 32)
+            at += 3 + length
+        self.assertEqual(at, len(packed))
+
+    def test_unpack_request_rejects_a_truncated_frame(self):
+        self.assertEqual(netctl.unpack_request(b'\x03lab\x02pw'), ('lab', 'pw'))
+        self.assertEqual(netctl.unpack_request(b'\x03lab'), ('lab', ''))
+        with self.assertRaises(netctl.NetError):
+            netctl.unpack_request(b'\x09lab')
+        with self.assertRaises(netctl.NetError):
+            netctl.unpack_request(b'')
+
+    def test_state_distinguishes_unknown_from_disconnected(self):
+        with patch.object(netctl, '_run', side_effect=netctl.NetError('no nmcli')):
+            self.assertIsNone(netctl.state())
+        with patch.object(netctl, '_run', return_value=' :40:other\n*:65:lab\n'):
+            self.assertEqual(netctl.state(),
+                             {'connected': True, 'ssid': 'lab', 'signal': 65})
+        with patch.object(netctl, '_run', return_value=' :40:other\n'):
+            self.assertEqual(netctl.state(),
+                             {'connected': False, 'ssid': '', 'signal': None})
+
+    def test_helper_answers_json_for_every_verb(self):
+        with patch.object(netctl, 'scan', return_value=[]):
+            self.assertEqual(netctl.handle({'verb': 'scan'}), {'ok': True, 'networks': []})
+        with patch.object(netctl, 'connect', side_effect=netctl.NetError('nope')):
+            self.assertEqual(netctl.handle({'verb': 'connect', 'ssid': 'a'}),
+                             {'ok': False, 'error': 'nope'})
+        self.assertFalse(netctl.handle({'verb': 'reboot'})['ok'])
+        self.assertFalse(netctl.handle('not a request')['ok'])
 
 
 class MaintenanceTests(unittest.TestCase):
@@ -379,9 +772,12 @@ class LinuxPtyTests(unittest.TestCase):
         master, slave = pty.openpty()
         device = os.ttyname(slave)
         env = dict(os.environ, PYTHONPATH=str(ROOT / 'linux'))
+        diagnostics = tempfile.TemporaryFile(mode='w+t')
+        self.addCleanup(diagnostics.close)
         process = subprocess.Popen([sys.executable, '-B', '-c',
-                                    'import sys;from mixosd import serve;serve(sys.argv[1],"/bin/sh")', device],
-                                   env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                    'import sys;from mixosd import serve;serve(sys.argv[1],"/bin/sh",sys.argv[2])',
+                                    device, str(ROOT / 'linux' / 'apps')],
+                                   env=env, stdout=subprocess.DEVNULL, stderr=diagnostics)
         decoder = Decoder()
         received = []
         seq = 1
@@ -406,12 +802,16 @@ class LinuxPtyTests(unittest.TestCase):
                     return True
             return False
         try:
-            # Retry HELLO while the daemon opens and flushes the virtual serial port.
-            for _ in range(10):
+            # A cold Python import on WSL/NTFS can exceed one second while a
+            # target build is active. Bound process startup separately from the
+            # protocol exchange deadlines; retry HELLO as a real device does.
+            startup_deadline = time.monotonic() + 10
+            while process.poll() is None and time.monotonic() < startup_deadline:
                 send(T.HELLO, payload=struct.pack('<HH', 512, 4096))
                 if receive_until(lambda: any(f.type == T.HELLO_ACK for f in received), 0.1):
                     break
-            self.assertTrue(any(f.type == T.HELLO_ACK for f in received))
+            diagnostics.seek(0)
+            self.assertTrue(any(f.type == T.HELLO_ACK for f in received), diagnostics.read())
             send(T.OPEN, C.TERMINAL, 9, struct.pack('<HH', 80, 28))
             self.assertTrue(receive_until(lambda: any(f.type == T.OPENED for f in received)))
             send(T.CREDIT, C.TERMINAL, 9, struct.pack('<I', 4096))
@@ -434,7 +834,7 @@ class LinuxPtyTests(unittest.TestCase):
             os.close(slave)
 
     def test_real_shell_input_resize_and_exit(self):
-        shell = PtyShell(80, 28)
+        shell = PtyShell(80, 28, ['/bin/sh', '-i'])
         output = bytearray()
         try:
             shell.resize(100, 30)

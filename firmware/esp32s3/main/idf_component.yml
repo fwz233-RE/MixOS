@@ -2,3 +2,9 @@ dependencies:
   idf: '==5.4.2'
   espressif/esp_codec_dev: '==1.6.2'
   espressif/freetype: '==2.14.3'
+  # The local interface is drawn by LVGL. esp_lvgl_port is what binds it to the
+  # RGB panel with the panel's own framebuffers as LVGL draw buffers, which is
+  # the only arrangement in which esp_lcd_panel_draw_bitmap() actually flips a
+  # page instead of copying into the buffer being scanned out.
+  lvgl/lvgl: '~9.2'
+  espressif/esp_lvgl_port: '~2.4'

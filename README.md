@@ -2,7 +2,17 @@
 
 MixOS is an isolated firmware and host-service project for the dual-chip device. The ESP32-S3 owns the display, touch input, local navigation, terminal rendering, power status, and audio-facing device behavior. The STM32 scans the keyboard and reports bounded input events over I2C. A Linux `mixosd` service provides one ordinary-user PTY session, host metrics, and fixed-scope jobs over the existing USB CDC link.
 
-## Hardware status
+## Current hardware status — 2026-09-18
+
+The ESP32-S3 completed **10 consecutive button-free A/B application updates** on the test device. Each update verified the complete application-file SHA-256, ELF identity, expected running and boot slots, a new boot ID, actual VALID state, maintenance health acknowledgement, sustained heartbeats, and Linux service restoration. The operator confirmed that the final `532717dd` build displays normally.
+
+The native Linux command `mixos-esp-update` is installed on the test device. A submitted update runs as a persistent systemd job and does not depend on Windows or a continuous SSH connection. Two unanswered runtime-measurement requests during the ten-update sequence recovered through strictly bounded, read-only remeasurement; their exact underlying loss point remains unproven. Previous failed sequences remain recorded and were not counted toward the successful ten.
+
+The latest full regression ran 1065 tests on each platform: Linux passed 1061 with 4 skips; Windows passed 1050 with 15 skips. This is normal-update acceptance, **not a guarantee of recovery from every hang or power loss**. Deliberate fault/power-loss tests remain pending; the operator chose to preserve the working device until a spare board or an independent reset channel is available. See [deployment evidence and limitations](docs/DEPLOYMENT.md), [updater usage](docs/ESP_OTA.md), and [implementation details](docs/ESP_OTA_V2.md).
+
+Raw hardware evidence, full Flash backups, build outputs, and local toolchains are retained outside Git under ignored directories. The repository contains source, tests, documentation, and evidence references; publishing it does not also upload those recovery files.
+
+## Historical hardware milestone — 2026-09-11
 
 **The new ESP application and font are deployed and full-readback-verified (2026-09-11).** Mandatory display-update screen confirmation has been removed: an explicit host update command now authorizes maintenance. The new app/font were written once after a fresh 8 MiB backup; the complete 8 MiB readback matched the expected image, including all unchanged protected bytes. The default RTS reset left the chip in download mode, so a separately recorded, identity-checked watchdog reset started the new application without reflashing. The new firmware passed a 15-second heartbeat check and returned automatic `UPDATE_READY` about 0.2 seconds after PREPARE, without local touch/key input or another boot request. `mixosd` is active. The STM32 USB-clock correction was then clean-built and flashed once without physical buttons; full 32 KiB readback passed, but its application still returned to ROM (USB device 21). Keyboard startup/input health remains unresolved; actual LCD appearance and keyboard input are not claimed verified. See `docs/DEPLOYMENT.md`, `docs/ESP_HOST_UPDATE.md`, and `build/deploy/RELEASE.json` for evidence.
 
@@ -40,7 +50,9 @@ The ESP32-S3 application has been cross-built and an earlier revision deployed t
 
 ## Updating the display firmware
 
-Routine ESP32-S3 updates go over the existing USB CDC link with one command, `tools/deploy_ota.py`, which streams the image into the unused application slot: the running build is never written, nothing is selected until the image arrived and its SHA-256 matched, and a build that fails to prove itself is rolled back by the bootloader. This requires the A/B partition layout in `firmware/esp32s3/partitions.csv`. A device still on the historic single-application layout needs one serial migration first, `tools/deploy_display.py --stage --migrate`, which rewrites the bootloader, the partition table and the application while leaving `nvs`, `phy_init` and the 4 MiB font partition byte-identical. Both paths are described in `docs/ESP_OTA.md`.
+Routine ESP32-S3 updates use the Linux-native command `mixos-esp-update apply --package /path/to/release --timeout 60 --health-timeout 180 --wait`. It validates a self-contained release, coordinates exclusive CDC access with `mixosd`, transfers to the inactive application slot, and verifies the actual running image and service restoration before reporting success. Use `mixos-esp-update status --job <job-id>` to inspect an existing job; uncertain outcomes require transaction reconciliation, not a blind reflash. `tools/deploy_ota.py` is an optional SSH wrapper around the same updater.
+
+A/B rollback protects an unconfirmed candidate when a reset allows the bootloader to act; it does not imply that every later hang of a VALID image automatically switches slots. The current test device already has the A/B layout and needs no migration. Historical single-slot migration and first-safe-install procedures are separate, explicitly authorized operations, not automatic fallback paths for routine update failures. See [ESP_OTA.md](docs/ESP_OTA.md) for prerequisites and recovery boundaries.
 
 ## Protocol
 
@@ -48,4 +60,4 @@ USB CDC uses protocol v1 in `protocol/USB_V1.md`: COBS frames terminated by zero
 
 ## License and provenance
 
-Source provenance and license locations are recorded in `docs/SOURCES.md`. The MixOS copies are independent working trees; no changes are made to the original repositories by this project.
+Source provenance and license locations are recorded in `docs/SOURCES.md`. The root license does not replace the licenses of bundled third-party components, fonts, or keyboard firmware; retain their accompanying notices and comply with their respective terms. The MixOS copies are independent working trees; no changes are made to the original repositories by this project.

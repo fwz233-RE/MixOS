@@ -1,0 +1,40 @@
+/* MixOS: let the settings page control Wi-Fi without running anything as root.
+ *
+ * Install as /etc/polkit-1/rules.d/50-mixos-network.rules (root-owned, 0644)
+ * and restart polkit.
+ *
+ * Why this file exists. `mixosd` runs as the ordinary user `pi` and must keep
+ * running as `pi`; it owns the USB link to the screen and has no business
+ * holding root. But on this device `nmcli general permissions` reports:
+ *
+ *     org.freedesktop.NetworkManager.wifi.scan               auth
+ *     org.freedesktop.NetworkManager.network-control         auth
+ *     org.freedesktop.NetworkManager.settings.modify.own     auth
+ *
+ * "auth" means an authentication agent must answer. There is no agent on a
+ * headless device, so a scan requested from the settings page does not fail
+ * quickly - it hangs until it times out, and the screen shows nothing useful.
+ * Group membership alone does not change this; the rule below does.
+ *
+ * What it grants, and to whom. Exactly the three actions the settings page
+ * needs, to members of `netdev` only. It does not grant modify.system, so `pi`
+ * can create and edit its own connection profiles but cannot rewrite the
+ * machine's system-wide networking. Adding an action here is the only way to
+ * widen it, which is the point.
+ *
+ * Note the absence of a `subject.local` or `subject.active` test. Those ask
+ * whether the caller holds a seated login session. `mixosd` is a systemd
+ * system service and has no session at all, so requiring one would reject
+ * precisely the caller this rule exists for. Membership of `netdev` is the
+ * check that actually means something here.
+ */
+polkit.addRule(function (action, subject) {
+    var allowed = {
+        "org.freedesktop.NetworkManager.wifi.scan": true,
+        "org.freedesktop.NetworkManager.network-control": true,
+        "org.freedesktop.NetworkManager.settings.modify.own": true
+    };
+    if (allowed[action.id] && subject.isInGroup("netdev")) {
+        return polkit.Result.YES;
+    }
+});
