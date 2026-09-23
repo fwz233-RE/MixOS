@@ -34,6 +34,8 @@ esp_err_t mix_i2c_init(i2c_master_bus_handle_t bus);
 
 /* Hold the bus across several transfers, for read-modify-write sequences. */
 void mix_i2c_lock(void);
+/* Zero-wait acquisition for input sampling during LCD frame waits. */
+bool mix_i2c_try_lock(void);
 void mix_i2c_unlock(void);
 
 /* Reset the controller and the bus. Serialised against every helper here. */

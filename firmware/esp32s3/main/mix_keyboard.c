@@ -18,6 +18,7 @@ static bool online, waiting_release, scheduled;
 static uint32_t next_poll, session, serial, remote_overflow, overflows;
 static uint16_t expected, rows[6];
 static uint8_t backlight_steps;
+static int reported_backlight = -1, pending_backlight = -1;
 static uint16_t u16(const uint8_t *p) { return (uint16_t)(p[0] | ((uint16_t)p[1] << 8)); }
 static uint32_t u32(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
 static uint16_t crc16(const uint8_t *data, size_t len) {
@@ -38,7 +39,9 @@ void mix_keyboard_reset_input(void) {
 static void failed(uint32_t now) {
     online = false;
     session = 0;
+    reported_backlight = -1;
     backlight_steps = 0;
+    // An absolute set remains pending until it is actually transmitted.
     mix_keyboard_reset_input();
     next_poll = now + OFFLINE_MS;
 }
@@ -53,6 +56,7 @@ esp_err_t mix_keyboard_init(mix_key_cb cb, void *ctx) {
     callback = cb; context = ctx;
     online = scheduled = false; session = 0;
     remote_overflow = overflows = 0; backlight_steps = 0;
+    reported_backlight = pending_backlight = -1;
     memset(rows, 0, sizeof(rows));
     mix_input_init(cb, ctx); mix_keyboard_reset_input();
     device = mix_i2c_add_device(MIX_KEYBOARD_I2C_ADDR, I2C_FAST_HZ);
@@ -60,6 +64,13 @@ esp_err_t mix_keyboard_init(mix_key_cb cb, void *ctx) {
 }
 bool mix_keyboard_online(void) { return online; }
 uint32_t mix_keyboard_overflows(void) { return overflows; }
+int mix_keyboard_backlight_level(void) { return online ? reported_backlight : -1; }
+void mix_keyboard_backlight_set(uint8_t level) {
+    if (level > 8) return;
+    pending_backlight = level;
+    // Absolute intent supersedes earlier increments (especially lock's set(0)).
+    backlight_steps = 0;
+}
 void mix_keyboard_backlight_step(void) {
     // Callback-safe: enqueue only; no nested bus access or EEPROM writes.
     if (online) backlight_steps = (uint8_t)((backlight_steps + 1) % 9);
@@ -84,11 +95,11 @@ void mix_keyboard_tick(uint32_t now) {
         if (!session) session = ++serial;
         uint8_t claim[5] = {0x13, (uint8_t)session, (uint8_t)(session >> 8), (uint8_t)(session >> 16), (uint8_t)(session >> 24)};
         online = false; remote_overflow = 0;
+        reported_backlight = -1; backlight_steps = 0;
         mix_keyboard_reset_input();
         if (write_bytes(claim, sizeof(claim)) != ESP_OK) failed(now);
         return;
     }
-    online = true;
     uint32_t overflow = u32(frame + 6);
     if (overflow != remote_overflow) {
         overflows += overflow - remote_overflow;
@@ -118,6 +129,8 @@ void mix_keyboard_tick(uint32_t now) {
         uint8_t ack[3] = {0x11, last[0], last[1]};
         if (write_bytes(ack, sizeof(ack)) != ESP_OK) { failed(now); return; }
     }
+    online = true;
+    reported_backlight = frame[22]; // Only device feedback, never a local target.
     if (waiting_release) {
         // Drain/discard bounded batches; arm ONLY at an atomic all-up boundary.
         // Events arriving after this snapshot survive the prefix ACK.
@@ -137,9 +150,11 @@ void mix_keyboard_tick(uint32_t now) {
         // Suppress repeats while a release could still be queued behind batch.
         if (frame[3] <= BATCH_SIZE && !waiting_release) mix_input_tick(now);
     }
-    if (backlight_steps) {
-        uint8_t cmd[2] = {0x20, (uint8_t)((frame[22] + backlight_steps) % 9)};
+    if (pending_backlight >= 0 || backlight_steps) {
+        int base = pending_backlight >= 0 ? pending_backlight : reported_backlight;
+        uint8_t cmd[2] = {0x20, (uint8_t)((base + backlight_steps) % 9)};
         backlight_steps = 0;
         if (write_bytes(cmd, sizeof(cmd)) != ESP_OK) failed(now);
+        else pending_backlight = -1; // Bus accepted; application is not confirmed.
     }
 }

@@ -67,6 +67,8 @@ class Type(IntEnum):
     SCREEN_INFO = 89
     SCREEN_DATA = 90
     SCREEN_END = 91
+    UI_PERF_REQUEST = 92
+    UI_PERF_RESPONSE = 93
     NET_SCAN = 96
     NET_LIST = 97
     NET_CONNECT = 98

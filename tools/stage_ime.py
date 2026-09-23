@@ -33,7 +33,7 @@ upstream builds on and does not compile with GCC 14 on Debian 13. Adding the
 include is the whole change; ``--scan-includes`` is how the six were found and
 is what to re-run after moving a pin.
 
-Three files of term-ime's own are edited, for defects with visible consequences.
+term-ime's own sources are edited for defects with visible consequences.
 ``Renderer::init`` enables raw mode by clearing three ``c_lflag`` bits and leaves
 ``IXON`` set, so the line discipline consumes Ctrl-S and Ctrl-Q as XOFF and XON
 and no program running inside term-ime ever receives them. In the notes editor
@@ -43,8 +43,13 @@ pinyin letter until the composition ends. And ``App::init`` spawns the child on
 a pseudo-terminal whose size is the 24x80 literal in ``Pty::spawn`` and never
 corrects it, so on this device - a 64x22 screen with the bottom row taken by the
 candidate bar - every full-screen program inside term-ime draws for a terminal
-16 columns too wide and 3 rows too tall. ``SOURCE_EDITS`` carries all three
-fixes and their reasons.
+16 columns too wide and 3 rows too tall. ``SOURCE_EDITS`` carries those fixes,
+plus a CSI u Shift+Space decoder and a launcher-scoped hint. The keyboard emits
+only a local action; the firmware owner forwards CSI 32;2u only to an allowed
+notes session. Without term-ime the Python toolkit consumes that named key,
+so it never turns into Ctrl+A or an inserted space. The notes launcher declares
+``MIXOS_IME_SHORTCUT=Shift+Space`` only under ``TERM=mixos``; other terminals
+retain the upstream Ctrl+A then Space hint and shortcut.
 
 The result is one deterministic tarball plus a manifest:
 
@@ -172,7 +177,8 @@ SCAN_SKIP = ('/test/', '/tests/', '/bindings/', '/doc/', '/docs/', '/sample/',
 # and the text it must match. Staging fails if the text is not found, so a pin
 # that moves cannot silently drop a fix.
 #
-# Both entries are defects with visible consequences on this device.
+# The original entries fix defects with visible consequences on this device.
+# Keyboard/hint patches follow them and are equally reproducible on re-stage.
 #
 # ``Renderer::init`` puts term-ime's controlling terminal into "raw mode" by
 # clearing three ``c_lflag`` bits and leaves ``c_iflag`` alone, so ``IXON``
@@ -251,6 +257,50 @@ SOURCE_EDITS: list[dict] = [
                'Pty::spawn unless a SIGWINCH arrives, so on this fixed-size '
                "screen every full-screen program inside term-ime draws for the "
                'wrong grid',
+    },
+    {
+        'path': 'src/core/input_processor.cpp',
+        'find': '    sm_.process_event(event);\n'
+                '    return result;\n',
+        'replace': '    sm_.process_event(event);\n'
+                   '    // CSI u: Unicode Space (32), Shift (2). Consume the entire key before\n'
+                   '    // composition or the child PTY sees it; Ctrl+A + Space remains supported.\n'
+                   "    if (result.forward && result.data == std::vector<uint8_t>{0x1b, '[', '3', '2', ';', '2', 'u'}) {\n"
+                   '        result.data.clear();\n'
+                   '        result.forward = false;\n'
+                   '        result.toggle_mode = true;\n'
+                   '    }\n'
+                   '    return result;\n',
+        'why': 'Decode Shift+Space CSI 32;2u as one mode-toggle event, including '
+               'split reads, without forwarding Ctrl+A or Space to the child; '
+               'the upstream Ctrl+A then Space shortcut is unchanged',
+    },
+    {
+        'path': 'src/ui/components.cpp',
+        'find': '#include <ftxui/dom/elements.hpp>\n',
+        'replace': '#include <ftxui/dom/elements.hpp>\n'
+                   '#include <cstdlib>\n'
+                   '#include <cstring>\n',
+        'why': 'Declare std::getenv and std::strcmp for the MixOS-only mode hint',
+    },
+    {
+        'path': 'src/ui/components.cpp',
+        'find': 'Element HintsBar() {\n'
+                '    return HBox({HintItem({.key = "^A Space", .action = I18n::t("hint.toggle_mode")}),\n',
+        'replace': 'static const char* ImeToggleHint() {\n'
+                   '    const char* term = std::getenv("TERM");\n'
+                   '    const char* shortcut = std::getenv("MIXOS_IME_SHORTCUT");\n'
+                   '    // Only the MixOS notes launcher declares the physical keyboard mapping.\n'
+                   '    return term && std::strcmp(term, "mixos") == 0 && shortcut &&\n'
+                   '                   std::strcmp(shortcut, "Shift+Space") == 0\n'
+                   '               ? "Shift+Space" : "^A Space";\n'
+                   '}\n'
+                   '\n'
+                   'Element HintsBar() {\n'
+                   '    return HBox({HintItem({.key = ImeToggleHint(), .action = I18n::t("hint.toggle_mode")}),\n',
+        'why': 'Advertise Shift+Space only when TERM=mixos and the notes launcher '
+               'declares MIXOS_IME_SHORTCUT=Shift+Space; ordinary terminals '
+               'retain the upstream ^A Space hint',
     },
 ]
 

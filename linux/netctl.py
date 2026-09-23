@@ -10,6 +10,7 @@ error rather than escalating.
 """
 import json
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
@@ -23,12 +24,20 @@ FRAME_LIMIT = 512
 # "\:" and is put back by _split, so a network named "a:b" stays one field.
 _TERSE = ['--terse']
 TIMEOUT_QUERY = 6
-TIMEOUT_SCAN = 25
+TIMEOUT_SCAN = 8
 TIMEOUT_CONNECT = 45
+# The device expires NET_SCAN after 20 seconds. Leave time for helper startup,
+# daemon polling and serial delivery; every scan subprocess shares this budget.
+TIMEOUT_SCAN_REQUEST = 16
+TIMEOUT_ACTIVATE = 2
 
 
 class NetError(Exception):
     """A request that failed for a reason worth showing on the device."""
+
+
+class NetTimeout(NetError):
+    """A timed-out activation may still be running in NetworkManager."""
 
 
 def _binary():
@@ -64,7 +73,7 @@ def _run(args, timeout):
             capture_output=True, text=True, timeout=timeout,
             stdin=subprocess.DEVNULL, env=_env(), check=False)
     except subprocess.TimeoutExpired:
-        raise NetError('NetworkManager did not answer in time')
+        raise NetTimeout('NetworkManager did not answer in time')
     except OSError as exc:
         raise NetError('cannot run nmcli: %s' % (exc.strerror or exc))
     if done.returncode != 0:
@@ -129,14 +138,56 @@ def wifi_device():
     return None
 
 
-def saved_profiles():
-    out = _run(_TERSE + ['--fields', 'TYPE,NAME', 'connection', 'show'], TIMEOUT_QUERY)
-    names = set()
+def _run_before(args, timeout, deadline):
+    """Apply one request's remaining budget to each nmcli subprocess."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise NetTimeout('network request deadline reached')
+    return _run(args, min(timeout, remaining))
+
+
+def saved_profiles(deadline=None):
+    """Map real SSIDs to profile metadata without reading any stored secrets.
+
+    connection.id (NAME) is only a user-assigned label. Enumerate UUIDs, then
+    fetch actual wireless settings in one batch rather than N timed queries.
+    """
+    if deadline is None:
+        deadline = time.monotonic() + TIMEOUT_QUERY
+    out = _run_before(_TERSE + ['--fields', 'TYPE,UUID', 'connection', 'show'],
+                      TIMEOUT_QUERY, deadline)
+    uuids = []
     for line in out.splitlines():
         got = _fields(line, 2)
-        if got and got[0].endswith('wireless'):
-            names.add(got[1])
-    return names
+        if got and got[0] in ('802-11-wireless', 'wifi') and got[1]:
+            uuids.append(got[1])
+    if not uuids:
+        return {}
+    args = _TERSE + ['--mode', 'multiline', '--fields',
+                    'connection.uuid,802-11-wireless.ssid,802-11-wireless.mode,'
+                    '802-11-wireless-security.key-mgmt', 'connection', 'show']
+    for uuid in uuids:
+        args += ['uuid', uuid]
+    out = _run_before(args, TIMEOUT_QUERY, deadline)
+    records, record = [], {}
+    for line in out.splitlines():
+        # Unlike terse tabular output, multiline values are not colon/backslash
+        # escaped. Split only the property separator and preserve the SSID.
+        key, separator, value = line.partition(':')
+        if not separator:
+            continue
+        if key == 'connection.uuid':
+            record = {'uuid': value}
+            records.append(record)
+        else:
+            record[key] = value
+    profiles = {}
+    expected = set(uuids)
+    for record in records:
+        ssid = record.get('802-11-wireless.ssid', '')
+        if record['uuid'] in expected and ssid:
+            profiles.setdefault(ssid, []).append(record)
+    return profiles
 
 
 def _strength(text):
@@ -146,22 +197,25 @@ def _strength(text):
         return 0
 
 
-def scan(rescan=True):
-    """Returns up to SCAN_MAX networks, strongest first, duplicates merged."""
-    args = _TERSE + ['--fields', 'SIGNAL,SECURITY,IN-USE,SSID', 'device', 'wifi', 'list']
-    if rescan:
-        args += ['--rescan', 'yes']
-    out = _run(args, TIMEOUT_SCAN if rescan else TIMEOUT_QUERY)
+def scan(rescan=True, auto_connect=False):
+    """Inspect every AP before limiting the display to SCAN_MAX networks."""
+    deadline = time.monotonic() + TIMEOUT_SCAN_REQUEST
+    args = _TERSE + ['--fields', 'SIGNAL,SECURITY,IN-USE,SSID', 'device', 'wifi', 'list',
+                    '--rescan', 'yes' if rescan else 'no']
+    out = _run_before(args, TIMEOUT_SCAN if rescan else TIMEOUT_QUERY, deadline)
     try:
-        known = saved_profiles()
+        known = saved_profiles(deadline)
     except NetError:
-        known = set()
+        known = {}
     best = {}
+    any_active = False
     for line in out.splitlines():
         got = _fields(line, 4)
         if not got:
             continue
         signal, security, in_use, ssid = got
+        active = in_use.strip() == '*'
+        any_active |= active  # Includes hidden APs and rows beyond SCAN_MAX.
         if not ssid:
             continue  # a hidden network has nothing to show or tap
         strength = _strength(signal)
@@ -171,13 +225,86 @@ def scan(rescan=True):
             'signal': strength,
             'secured': bool(security) and security != '--',
             'known': ssid in known,
-            'active': in_use.strip() == '*',
+            'active': active,
         }
         previous = best.get(ssid)
+        if previous is not None:
+            # A stronger BSSID must not erase an association to a weaker one.
+            entry['active'] |= previous['active']
+            previous['active'] = entry['active']
         if previous is None or strength > previous['signal']:
             best[ssid] = entry
     ordered = sorted(best.values(), key=lambda e: (-e['signal'], e['ssid']))
+    if auto_connect and not any_active:
+        auto_connect_saved(ordered, known, deadline)
     return ordered[:SCAN_MAX]
+
+
+def _wifi_idle(deadline):
+    """Fail closed unless all Wi-Fi devices are idle and one is usable.
+
+    Check the devices themselves, not a truncated/stale AP listing. This also
+    protects hidden associations and connections currently being established.
+    _env() fixes the locale, so these device-state names are stable.
+    """
+    out = _run_before(_TERSE + ['--fields', 'TYPE,STATE,DEVICE', 'device', 'status'],
+                      TIMEOUT_QUERY, deadline)
+    usable = False
+    for line in out.splitlines():
+        got = _fields(line, 3)
+        if not got:
+            return False
+        kind, state, device = got
+        if kind != 'wifi':
+            continue
+        if state not in ('disconnected', 'unavailable', 'unmanaged'):
+            return False
+        if state == 'disconnected' and _valid_interface(device):
+            usable = True
+    return usable
+
+
+def activate_saved(uuid, deadline=None):
+    """Submit a UUID activation; NetworkManager supplies its stored secrets.
+
+    --wait 0 only waits for acceptance, not authentication/DHCP. Acceptance is
+    not evidence of an association: the normal state query confirms that later.
+    Let NetworkManager select a compatible interface rather than forcing the
+    first radio (the profile may be bound to a different radio).
+    """
+    if deadline is None:
+        deadline = time.monotonic() + TIMEOUT_ACTIVATE
+    _run_before(['--wait', '0', 'connection', 'up', 'uuid', uuid],
+                TIMEOUT_ACTIVATE, deadline)
+
+
+def auto_connect_saved(entries, profiles, deadline):
+    """Best effort within the scan budget, without displacing a connection."""
+    if any(entry.get('active') for entry in entries):
+        return ''
+    for entry in entries:
+        if not entry.get('secured'):
+            continue
+        for profile in profiles.get(entry['ssid'], []):
+            if profile.get('802-11-wireless.mode') not in ('', 'infrastructure'):
+                continue
+            if profile.get('802-11-wireless-security.key-mgmt', '') in ('', '--', 'owe'):
+                # OWE encrypts an open network without a password. Neither it
+                # nor a same-named open profile qualifies as saved credentials.
+                continue
+            try:
+                if not _wifi_idle(deadline):
+                    return ''
+            except NetError:
+                return ''  # Unknown state must never be treated as offline.
+            try:
+                activate_saved(profile['uuid'], deadline)
+            except NetTimeout:
+                return ''  # Acceptance is unknown; do not start a rival attempt.
+            except NetError:
+                continue  # Immediate rejection: recheck state before another UUID.
+            return 'activation requested for %s' % entry['ssid']
+    return ''
 
 
 def connect(ssid, passphrase=None):
@@ -198,31 +325,80 @@ def connect(ssid, passphrase=None):
 
 def forget(ssid):
     ssid = _check_ssid(ssid)
-    if ssid not in saved_profiles():
+    deadline = time.monotonic() + 8  # The daemon allows ten seconds for forget.
+    profiles = saved_profiles(deadline).get(ssid, [])
+    if not profiles:
         raise NetError('no saved profile for %s' % ssid)
-    _run(['connection', 'delete', 'id', ssid], TIMEOUT_QUERY)
+    args = ['connection', 'delete']
+    for profile in profiles:
+        args += ['uuid', profile['uuid']]
+    _run_before(args, TIMEOUT_QUERY, deadline)
     return 'forgot %s' % ssid
+
+
+_INTERFACE_CHARS = frozenset(
+    'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-')
+
+
+def _valid_interface(device):
+    """Accept only a kernel interface identity reported by NetworkManager."""
+    if not isinstance(device, str) or not device or device in ('.', '..') or len(device) > 15:
+        return False
+    return all(ch in _INTERFACE_CHARS for ch in device)
+
+
+def _interface_bytes(device, direction):
+    """Read one counter for one explicitly reported, validated interface."""
+    if not _valid_interface(device) or direction not in ('rx', 'tx'):
+        return None
+    try:
+        path = Path('/sys/class/net') / device / 'statistics' / f'{direction}_bytes'
+        value = int(path.read_text())
+        return value if 0 <= value <= 0xffffffffffffffff else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _interface_link(device):
+    """Return interface and carrier generations while the link is up."""
+    if not _valid_interface(device):
+        return None
+    try:
+        path = Path('/sys/class/net') / device
+        if (path / 'carrier').read_text().strip() != '1':
+            return None
+        index = int((path / 'ifindex').read_text())
+        changes = int((path / 'carrier_changes').read_text())
+        return (index, changes) if index > 0 and changes >= 0 else None
+    except (OSError, ValueError):
+        return None
 
 
 def state():
     """Current Wi-Fi state for the status report, or None when unknown.
 
     None and "not connected" are different answers: the device shows an absent
-    report as unknown rather than inventing a disconnected radio.
+    report as unknown rather than inventing a disconnected radio. The active
+    interface identity lets the persistent daemon sample the kernel counters
+    independently of this slower NetworkManager query.
     """
     try:
-        out = _run(_TERSE + ['--fields', 'IN-USE,SIGNAL,SSID', 'device', 'wifi', 'list'],
-                   TIMEOUT_QUERY)
+        out = _run(_TERSE + ['--fields', 'IN-USE,DEVICE,SIGNAL,SSID',
+                             'device', 'wifi', 'list', '--rescan', 'no'], TIMEOUT_QUERY)
     except NetError:
         return None
     result = {'connected': False, 'ssid': '', 'signal': None}
     for line in out.splitlines():
-        got = _fields(line, 3)
-        if not got or got[0].strip() != '*':
+        got = _fields(line, 4)
+        if not got:
             continue
-        result['connected'] = True
-        result['ssid'] = got[2]
-        result['signal'] = _strength(got[1])
+        in_use, device, signal, ssid = got
+        if in_use.strip() != '*':
+            continue
+        result.update(connected=True, ssid=ssid,
+                      signal=_strength(signal))
+        if _valid_interface(device):
+            result['interface'] = device
         break
     return result
 
@@ -311,10 +487,13 @@ def handle(request):
     verb = request.get('verb')
     try:
         if verb == 'scan':
-            return {'ok': True, 'networks': scan()}
+            return {'ok': True, 'networks': scan(auto_connect=True)}
         if verb == 'state':
             current = state()
-            return {'ok': current is not None, 'state': current, 'ip': local_address(),
+            observed_at = time.monotonic()
+            device = current.get('interface') if current and current.get('connected') else None
+            return {'ok': current is not None, 'state': current,
+                    'observed_at': observed_at, 'ip': local_address(device),
                     'error': '' if current is not None else 'Wi-Fi state unavailable'}
         if verb == 'connect':
             return {'ok': True, 'message': connect(request.get('ssid'),

@@ -1,6 +1,7 @@
 #include "gt911.h"
 
 #include <string.h>
+#include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -94,6 +95,8 @@ static esp_err_t probe_addr(uint8_t addr, i2c_master_dev_handle_t *out_dev, uint
 
 esp_err_t gt911_init(i2c_master_dev_handle_t *out_dev)
 {
+    if (!out_dev) return ESP_ERR_INVALID_ARG;
+    *out_dev = NULL;
     /* 总线由 mix_i2c 持有，main.c 在建任何设备之前先初始化它 */
     // 复位时序 INT 拉低贯穿 → 地址 0x5D；万一时序被打断退回 0x14
     uint8_t id[4] = { 0 };
@@ -114,7 +117,7 @@ esp_err_t gt911_init(i2c_master_dev_handle_t *out_dev)
     // 0x8146 运行时分辨率是"配置是否真被芯片采纳"的判据（配置区 0x8047 只是
     // RAM 副本，写进去就能读回，不代表校验通过）
     uint8_t info[11] = { 0 };
-    reg_read(dev, REG_PRODUCT_ID, info, 11);
+    if ((err = reg_read(dev, REG_PRODUCT_ID, info, 11)) != ESP_OK) goto fail;
     int rt_x = info[6] | (info[7] << 8);
     int rt_y = info[8] | (info[9] << 8);
     ESP_LOGI(TAG, "GT911 @0x%02X ID=\"%c%c%c\" fw=0x%02X%02X 运行时分辨率=%dx%d Sensor_ID=0x%02X",
@@ -122,7 +125,7 @@ esp_err_t gt911_init(i2c_master_dev_handle_t *out_dev)
 
     // ---- 完整配置区 dump（0x8047..0x8100 共 186 字节）----
     uint8_t cfg[186] = { 0 };
-    reg_read(dev, 0x8047, cfg, sizeof(cfg));
+    if ((err = reg_read(dev, 0x8047, cfg, sizeof(cfg))) != ESP_OK) goto fail;
     for (int i = 0; i < 186; i += 31) {
         char line[3 * 31 + 1] = { 0 };
         int n = (186 - i < 31) ? (186 - i) : 31;
@@ -158,7 +161,7 @@ esp_err_t gt911_init(i2c_master_dev_handle_t *out_dev)
             return err;
         }
         vTaskDelay(pdMS_TO_TICKS(200));
-        reg_read(dev, REG_PRODUCT_ID, info, 11);
+        if ((err = reg_read(dev, REG_PRODUCT_ID, info, 11)) != ESP_OK) goto fail;
         rt_x = info[6] | (info[7] << 8);
         rt_y = info[8] | (info[9] << 8);
         ESP_LOGI(TAG, "下发后运行时分辨率=%dx%d %s", rt_x, rt_y,
@@ -167,11 +170,11 @@ esp_err_t gt911_init(i2c_master_dev_handle_t *out_dev)
             // 不走 RST 引脚的固件重启：命令寄存器 0x8040 = 0x02（软复位）。
             // 复位线（R78）不通时这是唯一能重启触摸固件的手段。
             ESP_LOGW(TAG, "尝试 GT911 软复位命令（0x8040=0x02）...");
-            reg_write_u8(dev, REG_COMMAND, 0x02);
+            if ((err = reg_write_u8(dev, REG_COMMAND, 0x02)) != ESP_OK) goto fail;
             vTaskDelay(pdMS_TO_TICKS(300));
-            reg_write_u8(dev, REG_COMMAND, 0x00);   // 回到读坐标模式
+            if ((err = reg_write_u8(dev, REG_COMMAND, 0x00)) != ESP_OK) goto fail;
             vTaskDelay(pdMS_TO_TICKS(100));
-            reg_read(dev, REG_PRODUCT_ID, info, 11);
+            if ((err = reg_read(dev, REG_PRODUCT_ID, info, 11)) != ESP_OK) goto fail;
             rt_x = info[6] | (info[7] << 8);
             rt_y = info[8] | (info[9] << 8);
             ESP_LOGI(TAG, "软复位后运行时分辨率=%dx%d Sensor_ID=0x%02X %s",
@@ -187,6 +190,9 @@ esp_err_t gt911_init(i2c_master_dev_handle_t *out_dev)
 
     *out_dev = dev;
     return ESP_OK;
+fail:
+    mix_i2c_rm_device(dev);
+    return err;
 }
 
 // 调试：读原始状态寄存器 0x814E（不清除）
@@ -195,46 +201,58 @@ esp_err_t gt911_raw_status(i2c_master_dev_handle_t dev, uint8_t *status)
     return reg_read(dev, REG_STATUS, status, 1);
 }
 
-esp_err_t gt911_read(i2c_master_dev_handle_t dev, gt911_touch_t *t)
+static esp_err_t read_touch(i2c_master_dev_handle_t dev, gt911_touch_t *t, bool quick)
 {
-    /* 状态读 → 坐标读 → 清状态必须是一组原子操作。中间若插入别的任务的传输
-     * （键盘轮询、电池日志）甚至一次总线复位，就可能在读坐标之前把这一帧的
-     * 状态位丢掉，表现为触摸偶发丢点。 */
-    mix_i2c_lock();
+    if (!dev || !t) return ESP_ERR_INVALID_ARG;
+    memset(t, 0, sizeof(*t));
+    /* Keep status, coordinates and acknowledgement together on the bus.
+     * Never wait behind a sensor/recovery transaction inside an LCD wait. */
+    if (quick) {
+        if (!mix_i2c_try_lock()) return ESP_ERR_NOT_FOUND;
+    } else mix_i2c_lock();
+    int timeout = quick ? 4 : I2C_XFER_TIMEOUT_MS;
     uint8_t status = 0;
-    esp_err_t err = reg_read(dev, REG_STATUS, &status, 1);
+    esp_err_t err = mix_i2c_read_wide(dev, REG_STATUS, &status, 1, timeout);
     if (err != ESP_OK) {
         mix_i2c_unlock();
         return err;
     }
     if (!(status & 0x80)) {
-        // 参考 esp_lcd_touch_gt911：即使无数据也清一次状态，保持与官方驱动一致
-        reg_write_u8(dev, REG_STATUS, 0);
+        /* No ready frame is ordinary idle, not a release or an I2C error.
+         * Clearing here could discard a frame arriving after this read. */
         mix_i2c_unlock();
-        return ESP_ERR_NOT_FOUND;  // 无新数据
+        return ESP_ERR_NOT_FOUND;
     }
 
-    t->count = status & 0x0F;
-    if (t->count > 0) {
-        // 每个触点 8 字节：track_id, xL, xH, yL, yH, sizeL, sizeH, rsv
-        uint8_t p[8] = { 0 };
-        err = reg_read(dev, REG_POINT0, p, 8);
-        if (err != ESP_OK) {
-            t->count = 0;
-            reg_write_u8(dev, REG_STATUS, 0);
-            mix_i2c_unlock();
-            return err;
-        }
-        t->x = p[1] | (p[2] << 8);
-        t->y = p[3] | (p[4] << 8);
-        if (t->count > 5 || t->x >= 1024 || t->y >= 768) {
-            t->count = 0;
-            reg_write_u8(dev, REG_STATUS, 0);
-            mix_i2c_unlock();
-            return ESP_ERR_INVALID_RESPONSE;
+    gt911_touch_t frame = {.count = status & 0x0F};
+    if (frame.count > 5) err = ESP_ERR_INVALID_RESPONSE;
+    else if (frame.count > 0) {
+        uint8_t p[8] = {0};
+        err = mix_i2c_read_wide(dev, REG_POINT0, p, sizeof(p), timeout);
+        if (err == ESP_OK) {
+            frame.x = p[1] | (p[2] << 8);
+            frame.y = p[3] | (p[4] << 8);
+            if (frame.x >= LCD_H_RES || frame.y >= LCD_V_RES)
+                err = ESP_ERR_INVALID_RESPONSE;
         }
     }
-    reg_write_u8(dev, REG_STATUS, 0);  // 清状态，准备下一帧
+    /* A failed acknowledgement must not publish a contact or release, since
+     * the same stale frame may be returned again. Propagate it for recovery. */
+    const uint8_t clear[] = {REG_STATUS >> 8, REG_STATUS & 0xff, 0};
+    esp_err_t ack = quick ? mix_i2c_transmit(dev, clear, sizeof(clear), timeout) :
+                            reg_write_u8(dev, REG_STATUS, 0);
     mix_i2c_unlock();
-    return ESP_OK;
+    if (ack != ESP_OK) return ack;
+    if (err == ESP_OK) *t = frame;
+    return err;
+}
+
+esp_err_t gt911_read(i2c_master_dev_handle_t dev, gt911_touch_t *t)
+{
+    return read_touch(dev, t, false);
+}
+
+esp_err_t gt911_try_read(i2c_master_dev_handle_t dev, gt911_touch_t *t)
+{
+    return read_touch(dev, t, true);
 }

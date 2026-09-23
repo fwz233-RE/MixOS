@@ -33,6 +33,12 @@ between upstream and this device lives here, where it can be read in one place:
    ``IPAddressDeny=any``, so a request for a model that was not staged is not a
    slow first request, it is a failed one.
 
+5. **Chinese decoding has a sufficient output budget.** Moonshine's default
+   per-second token budget truncates Chinese even with a complete recording.
+   A same-waveform device comparison recovered the missing sentence ending at
+   16 tokens/second, while adding silence did not. The Chinese recognizer alone
+   gets this bounded override; model files, VAD and English settings stay intact.
+
 Run it:
 
     python3 -m linux.apps.translator.service            # 127.0.0.1:3000
@@ -58,6 +64,10 @@ DEFAULT_PORT = 3000
 # a package that only exists on the device. tools/stage_speech.py declares the
 # same value, and tests/test_apps.py fails if the two drift apart.
 STT_MODEL_ARCH = {'en': 4}
+# Tokens are model subword units, not characters. A Chinese character can use
+# multiple tokens; the unconfigured decoder can reach its cap before sentence
+# end. 16 is finite and measured against complete short/long Chinese fixtures.
+STT_OPTIONS = {'zh': {'max_tokens_per_second': 16}}
 
 
 def load_upstream():
@@ -121,6 +131,40 @@ def apply_model_choice() -> str:
     return f'speech model sizes: {chosen}'
 
 
+def apply_stt_options(upstream) -> None:
+    """Configure Chinese decoding without editing the vendored backend.
+
+    Keep upstream's lock, two-model LRU cache and other languages unchanged.
+    This is installed once before the HTTP server or prewarm thread starts.
+    """
+    original = upstream.get_stt_recognizer
+    if getattr(original, 'mixos_options_wrapped', False) is True:
+        return
+
+    def configured(language='en'):
+        options = STT_OPTIONS.get(language)
+        if not options:
+            return original(language)
+        with upstream._stt_lock:
+            cache = upstream._stt_recognizers
+            if language in cache:
+                cache.move_to_end(language)
+                return cache[language]
+            from moonshine_voice import get_model_for_language, Transcriber
+            if len(cache) >= upstream.MAX_MODELS:
+                _, evicted = cache.popitem(last=False)
+                del evicted
+            model_path, model_arch = get_model_for_language(language)
+            recognizer = Transcriber(model_path=model_path, model_arch=model_arch,
+                                      options=dict(options))
+            cache[language] = recognizer
+            print(f'[STT] {language}: decoder options {options}', flush=True)
+            return recognizer
+
+    configured.mixos_options_wrapped = True
+    upstream.get_stt_recognizer = configured
+
+
 class LocalServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
@@ -152,6 +196,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f'WARNING: could not set the speech model sizes ({exc}); the backend '
               f'will ask for moonshine\'s defaults, which are not what is staged '
               f'on this device.', flush=True)
+
+    apply_stt_options(upstream)
 
     if args.host != DEFAULT_HOST:
         print(f'WARNING: binding {args.host} publishes speech recognition, speech '

@@ -18,6 +18,7 @@ python tools/run_checks.py
 
 - 使用 ESP-IDF 5.4.2、ESP32-S3 目标及仓库锁定的组件版本；具体工具目录由 `tools/idf_env.py` 定义。
 - 核对 `firmware/esp32s3/main/idf_component.yml`、`firmware/esp32s3/dependencies.lock` 和实际生成配置。
+- 显示仅保留 `1024×768`、RGB565 双缓冲、26 MHz 像素时钟和 16 行 bounce 缓冲的稳定路径；高刷与 RGB332 实验实现及配置入口已删除，CPU、PSRAM 和看门狗配置保持不变。
 - `firmware/esp32s3/codec_overlay.cmake` 将 ES8389 编译单元替换为本地覆盖实现；应检查解析出的完整组件和覆盖结果，而非直接修改受管理依赖。
 - 准备[字体构建](FONT_BUILD.md)生成的 TTF 和 manifest，驱动按固定名称读取 `build/font/MiSans-Normal-gb2312.ttf` 及其清单。
 - `tests/esp_font_build.py` 仍绑定已知恢复应用和先前候选的大小、摘要。它要求 `build/esp32s3` 内有匹配的保留副本，或能从现有产物严格核验并保存。
@@ -46,7 +47,9 @@ Linux／WSL 可将 `py -3.12` 换为配置好的 `python`。驱动先核验恢�
 py -3.12 tests/esp_font_build.py build --build-dir build/esp-candidate --report-dir build/esp-candidate-report
 ```
 
-隔离输出仍依赖原恢复副本及固定字体路径。`preserve` 只保存／核验既有镜像；`report` 只复核稳定构建记录，不能为旧二进制补造当前源码来源。
+隔离输出仍依赖原恢复副本及固定字体路径。对于已经配置在隔离目录内的实验 `sdkconfig`，构建与打包都要显式传入 `--isolated-config`；构建器会直接使用并绑定 `--build-dir/sdkconfig`，不会把默认稳定配置当成实验配置的来源。缺少该文件会拒绝构建，编译期间文件变化也会拒绝生成证明。该选项必须与隔离的编译、报告目录同时使用，不修改项目默认 `sdkconfig`。
+
+`preserve` 只保存／核验既有镜像；`report` 只复核稳定构建记录，不能为旧二进制补造当前源码来源。
 
 `bash tools/build_esp_local.sh` 可用于 Linux／WSL 编译排错，但它与裸 `idf.py build` 都不会生成上述发布记录。发布前须通过构建驱动重新构建并核验；使用跳过构建检查的选项不能修复来源不一致。
 

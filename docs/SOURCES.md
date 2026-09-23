@@ -36,6 +36,7 @@ MixOS 中的固件副本供本项目构建使用，不应把原始仓库作为�
 - 该输入没有内嵌许可元数据；须向字体供应方取得并保存单独许可，确认子集化、合并图标及再分发条件后再发布。仓库许可不能授权未知来源字体。
 - 图标来自 [Google Material Design Icons / Material Symbols](https://github.com/google/material-design-icons)，上游许可入口为 [LICENSE](https://github.com/google/material-design-icons/blob/master/LICENSE)（Apache-2.0）。构建器读取用户准备的 Material Symbols Rounded 文件，不自动下载或固定其上游 commit。
 - 图标源文件摘要和固定轴实例写入字体 manifest；发布者还应保存所用下载版本或 commit 及许可副本，不能把可变的上游分支当成固定来源。
+- 游戏入口使用同一字体中的官方 `sports_esports`（U+EA28）。其 70px A8 资源由 `tools/build_material_icon.py` 机械生成，固定 `FILL=0/wght=400/GRAD=0/opsz=24`，没有人工重描。来源固定为 Google 仓库 commit `40a7a292a79d9394157e1ea24f83d52d5e17c556`，字体 SHA-256 `f1472f172c0fc4a922be22972e4752ccc54fe795ed82564ab6f6b097782f2dbc`；许可副本与派生清单在 `build/icons/material-game-icon/`，头文件也记录完整来源。它随应用打包，不修改已安装的文本字体分区。
 
 字体工具依赖为 fontTools 4.60.1 和 Pillow 11.2.1，见 `tools/requirements-host.txt`。其上游分别保留 fontTools MIT 和 Pillow HPND 许可；实际 Pillow FreeType 引擎版本写入构建清单，与固件的 FreeType 版本分开记录。
 

@@ -1,9 +1,10 @@
 """Checks for the Chinese input path: staging term-ime, building it, proving it.
 
-Everything here runs on any machine. Nothing needs the device, a compiler, a
-network or a pseudo-terminal, with one exception that is skipped where it cannot
-hold: the flow-control check opens a real pseudo-terminal, which exists on Linux
-and not on Windows.
+Everything here runs on the host without a device or network. Most checks need
+only Python; the keyboard checks use an existing Clang when available, and the
+term-ime state-machine check uses its already staged source and headers. No new
+dependencies are installed. The flow-control checks open a real pseudo-terminal,
+which exists on Linux and not on Windows.
 
 What these are actually for. The build of term-ime happens on the device and
 takes tens of minutes, so every mistake that can be caught here instead of there
@@ -17,6 +18,7 @@ import importlib.util
 import io
 import os
 import shutil
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -75,6 +77,99 @@ class PinTests(unittest.TestCase):
         for table in (self.stage.PRUNED, self.stage.OMITTED):
             for path, why in table.items():
                 self.assertGreater(len(why), 20, f'{path} has no real reason')
+
+
+class KeyboardImeMappingTests(unittest.TestCase):
+    """The physical shortcut is a local action, never global text injection."""
+
+    def test_real_keyboard_one_shot_repeat_and_modifier_regressions(self):
+        clang = shutil.which('clang')
+        if not clang:
+            self.skipTest('existing clang unavailable')
+        temporary = Path(tempfile.mkdtemp(prefix='mixos-keyboard-ime-'))
+        self.addCleanup(shutil.rmtree, temporary, ignore_errors=True)
+        executable = temporary / 'keyboard.exe'
+        build = subprocess.run([
+            clang, '-std=c11', '-Wall', '-Wextra', '-Werror',
+            '-I', str(ROOT / 'firmware/esp32s3/main'),
+            str(ROOT / 'tests/test_input.c'),
+            str(ROOT / 'firmware/esp32s3/main/mix_input.c'),
+            '-o', str(executable)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+        run = subprocess.run([str(executable)], capture_output=True, text=True, timeout=10)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
+    def test_launcher_advertises_shortcut_only_on_a_mixos_terminal(self):
+        source = (ROOT / 'linux/launchers/notes').read_text(encoding='utf-8')
+        self.assertIn('if [ "${TERM:-}" = mixos ]; then\n'
+                      '        export MIXOS_IME_SHORTCUT=Shift+Space\n'
+                      '    else\n'
+                      '        unset MIXOS_IME_SHORTCUT\n', source)
+        self.assertLess(source.index('export MIXOS_IME_SHORTCUT'),
+                        source.index('exec "$IME" "$CONFIG"'))
+        self.assertIn('exec "$PYTHON" "$APP"', source)
+
+
+class TermImeInputHostTests(unittest.TestCase):
+    """Compile the real term-ime byte state machine, without Rime or a PTY."""
+
+    @classmethod
+    def setUpClass(cls):
+        compiler = shutil.which('clang++')
+        tree = ROOT / 'build/ime/src'
+        if not compiler or not (tree / 'deps/sml/include/boost/sml.hpp').is_file():
+            raise unittest.SkipTest('existing clang++ and staged term-ime headers needed')
+        temporary = Path(tempfile.mkdtemp(prefix='mixos-term-ime-'))
+        cls.addClassCleanup(shutil.rmtree, temporary, ignore_errors=True)
+        stage = load('mixos_stage_ime_host', ROOT / 'tools/stage_ime.py')
+        hint_edit = next(e for e in stage.SOURCE_EDITS
+                         if 'static const char* ImeToggleHint()' in e['replace'])
+        # The helper is the exact production patch, not a rewritten test copy.
+        helper = hint_edit['replace'].split('\nElement HintsBar()', 1)[0]
+        (temporary / 'ime_hint_host.hpp').write_text(
+            '#include <cstdlib>\n#include <cstring>\n' + helper, encoding='utf-8')
+        cls.executable = temporary / 'term-ime-input.exe'
+        build = subprocess.run([
+            compiler, '-std=c++17', '-Wall', '-Wextra',
+            # spdlog's Windows backend includes windows.h: suppress the GDI
+            # Escape() symbol so upstream's input_sm::Escape stays unambiguous.
+            '-DNOGDI', '-D_CRT_SECURE_NO_WARNINGS',
+            '-I', str(temporary), '-I', str(tree / 'src/core'),
+            '-I', str(tree / 'deps/sml/include'),
+            '-I', str(tree / 'deps/spdlog/include'),
+            '-I', str(ROOT / 'firmware/esp32s3/main'),
+            str(ROOT / 'tests/test_ime_input_host.cpp'),
+            str(tree / 'src/core/input_processor.cpp'),
+            '-o', str(cls.executable)], capture_output=True, text=True, timeout=90)
+        if build.returncode:
+            raise AssertionError(build.stdout + build.stderr)
+
+    def test_exact_csi_consumption_and_legacy_ctrl_a_shortcuts(self):
+        run = subprocess.run([str(self.executable)], capture_output=True,
+                             text=True, timeout=10)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
+    def test_hint_depends_on_terminal_and_explicit_launcher_declaration(self):
+        for term, shortcut, expected in (
+            ('mixos', 'Shift+Space', 'Shift+Space'),
+            ('mixos', None, '^A Space'),
+            ('mixos', '', '^A Space'),
+            ('mixos', 'other', '^A Space'),
+            ('xterm-256color', 'Shift+Space', '^A Space'),
+            (None, 'Shift+Space', '^A Space'),
+            (None, None, '^A Space'),
+        ):
+            with self.subTest(term=term, shortcut=shortcut):
+                environment = dict(os.environ)
+                for name, value in (('TERM', term), ('MIXOS_IME_SHORTCUT', shortcut)):
+                    environment.pop(name, None)
+                    if value is not None:
+                        environment[name] = value
+                run = subprocess.run([str(self.executable), '--hint'],
+                                     env=environment, capture_output=True,
+                                     text=True, timeout=10)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertEqual(run.stdout, expected)
 
 
 class SourceFixTests(unittest.TestCase):
@@ -191,6 +286,44 @@ class SourceFixTests(unittest.TestCase):
         # as part of start-up, not after the parser has been built around it.
         self.assertLess(edit['replace'].index('pty_.resize'),
                         edit['replace'].index(edit['find']))
+
+    def test_keyboard_and_hint_patches_survive_a_clean_restage(self):
+        """Only SOURCE_EDITS is kept: the generated build tree is disposable."""
+        edits = [e for e in self.stage.SOURCE_EDITS
+                 if e['path'] in ('src/core/input_processor.cpp', 'src/ui/components.cpp')]
+        self.assertEqual(len(edits), 3)
+        self.stage.SOURCE_EDITS = edits
+        for relative in {e['path'] for e in edits}:
+            upstream = '\n'.join(e['find'] for e in edits if e['path'] == relative)
+            self.write(relative, upstream)
+        applied = self.stage.apply_source_edits()
+        self.assertTrue(all(e['state'] == 'applied' for e in applied))
+        before = {relative: (self.temporary / relative).read_bytes()
+                  for relative in {e['path'] for e in edits}}
+        for edit in edits:
+            self.assertIn(edit['replace'].encode(), before[edit['path']])
+        again = self.stage.apply_source_edits()
+        self.assertTrue(all(e['state'] == 'already applied' for e in again))
+        for relative, expected in before.items():
+            self.assertEqual((self.temporary / relative).read_bytes(), expected)
+
+    def test_local_staged_keyboard_and_hint_match_the_reproducible_patches(self):
+        tree = ROOT / 'build/ime/src'
+        if not (tree / 'src/ui/components.cpp').is_file():
+            self.skipTest('no local staged tree; clean-restage test covers patch source')
+        for edit in self.stage.SOURCE_EDITS:
+            if edit['path'] in ('src/core/input_processor.cpp', 'src/ui/components.cpp'):
+                with self.subTest(path=edit['path'], why=edit['why']):
+                    self.assertIn(edit['replace'], (tree / edit['path']).read_text(encoding='utf-8'))
+
+    def test_keyboard_patch_consumes_the_exact_sequence_without_child_output(self):
+        edit = next(e for e in self.stage.SOURCE_EDITS
+                    if e['path'] == 'src/core/input_processor.cpp')
+        self.assertIn('result.data.clear();', edit['replace'])
+        self.assertIn('result.forward = false;', edit['replace'])
+        self.assertIn('result.toggle_mode = true;', edit['replace'])
+        self.assertIn("{0x1b, '[', '3', '2', ';', '2', 'u'}", edit['replace'])
+        self.assertIn('sm_.process_event(event);', edit['replace'])
 
     def test_an_edit_whose_anchor_is_gone_stops_staging(self):
         edit = dict(self.stage.SOURCE_EDITS[0])

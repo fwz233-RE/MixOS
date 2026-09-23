@@ -30,6 +30,7 @@ from __future__ import annotations
 import array
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -42,7 +43,14 @@ DEFAULT_DEVICE = os.environ.get('MIXOS_AUDIO_DEVICE', 'plughw:CARD=UACCDC,DEV=0'
 SAMPLE_RATE = 16000        # what the speech recogniser is trained on
 CHANNELS = 1               # what a finished recording is, whatever was captured
 SAMPLE_BYTES = 2           # S16_LE
-READ_BLOCK = 4096          # 1024 stereo frames; a whole number of frames either way
+READ_BLOCK = 4096          # upper bound; read1 returns available partial blocks too
+# Bound ALSA's capture batching instead of accepting its device-dependent
+# default (often a 500 ms buffer with 125 ms periods). SIGTERM cannot recover
+# an unfinished ALSA period; keep that boundary short, then drain the pipe.
+CAPTURE_PERIOD_US = 20000
+CAPTURE_BUFFER_US = 100000
+CAPTURE_STOP_TIMEOUT = 2.0
+CAPTURE_STDERR_LIMIT = 8192
 
 # ---------------------------------------------------------------------------
 # Two microphones, one of which is not worth listening to
@@ -433,7 +441,9 @@ def capture_command(arecord: str, device: str, rate: int,
     takes the good one afterwards with ``voice_channel``.
     """
     return [arecord, '-q', '-D', device, '-f', 'S16_LE',
-            '-r', str(rate), '-c', str(channels), '-t', 'raw']
+            '-r', str(rate), '-c', str(channels), '-t', 'raw',
+            f'--period-time={CAPTURE_PERIOD_US}',
+            f'--buffer-time={CAPTURE_BUFFER_US}']
 
 
 def playback_command(aplay: str, device: str) -> list[str]:
@@ -489,81 +499,162 @@ class Recorder:
         self._level = 0.0
         self._started = 0.0
         self._error: str | None = None
+        self._stop_requested = False
+        self._stop_lock = threading.Lock()
+        self._stop_timer: threading.Timer | None = None
 
     # -- lifetime ------------------------------------------------------------
     def start(self) -> None:
-        if self._process is not None:
+        if self.running:
+            if self._error:
+                raise AudioUnavailable(self._error)
             return
+        # Reap the previous capture before replacing any state it could write.
+        if self._process is not None:
+            self.stop()
+            if self._process is not None:
+                raise AudioUnavailable(self._error or 'previous capture is still stopping')
         arecord = _tool('arecord')
         try:
-            self._process = subprocess.Popen(
+            process = subprocess.Popen(
                 capture_command(arecord, self.device, self.rate),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
         except OSError as exc:
             raise AudioUnavailable(f'could not start arecord: {exc}') from exc
+        self._process = process
         self._blocks, self._level, self._error = [], 0.0, None
+        self._stop_requested = False
         self._started = time.monotonic()
-        self._thread = threading.Thread(target=self._drain, daemon=True)
+        self._thread = threading.Thread(target=self._drain, args=(process,), daemon=True)
         self._thread.start()
 
-    def _drain(self) -> None:
-        stream = self._process.stdout
-        limit = int(MAX_SECONDS * self.rate) * SAMPLE_BYTES * CAPTURE_CHANNELS
-        held = 0
-        while True:
-            try:
-                block = stream.read(READ_BLOCK)
-            except (OSError, ValueError):
-                break
-            if not block:
-                break
-            with self._lock:
-                self._blocks.append(block)
-                held += len(block)
-                self._level = voice_channel_rms(block)
-            if held >= limit:
-                # Stop the capture but keep what was recorded: a two-minute
-                # take that ends by itself is better than one that is discarded.
-                self._terminate()
-                break
-
-    def _terminate(self) -> None:
-        process, self._process = self._process, None
+    def _signal_stop(self, process, *, kill: bool = False) -> None:
         if process is None:
             return
+        with self._stop_lock:
+            if process.poll() is not None:
+                return
+            if self._stop_requested and not kill:
+                return
+            self._stop_requested = True
+            try:
+                process.kill() if kill else process.terminate()
+            except ProcessLookupError:
+                return                   # natural exit raced the stop request
+            if not kill:
+                # The capacity limit is reached on the reader thread itself.
+                # It needs a deadline independent of read()/the UI calling stop.
+                self._stop_timer = threading.Timer(CAPTURE_STOP_TIMEOUT,
+                                                    self._force_stop, args=(process,))
+                self._stop_timer.daemon = True
+                self._stop_timer.start()
+
+    def _force_stop(self, process) -> None:
         if process.poll() is None:
-            process.terminate()
+            self._error = self._error or 'capture timed out; recording was not submitted'
+            self._signal_stop(process, kill=True)
+
+    def _drain(self, process: subprocess.Popen) -> None:
+        # This thread owns stdout until EOF. stop() only signals the producer;
+        # closing stdout there used to discard buffered speech at the tail.
+        stream = process.stdout
+        read = getattr(stream, 'read1', stream.read)
+        limit = int(MAX_SECONDS * self.rate) * SAMPLE_BYTES * CAPTURE_CHANNELS
+        held = 0
+        errors: list[str] = []
+
+        def drain_errors():
+            # Inspect the entire stream, retaining only the first real error.
+            # A long sequence of benign banners must not hide a later I/O fault.
+            # readline's size cap also bounds a producer that never emits '\\n'.
             try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=2)
+                while True:
+                    block = process.stderr.readline(CAPTURE_STDERR_LIMIT)
+                    if not block:
+                        return
+                    line = block.decode('utf-8', 'replace')
+                    problem = complaint(line)
+                    if problem and not errors:
+                        errors.append(problem)
+            except (OSError, ValueError) as exc:
+                if not errors:
+                    errors.append(f'capture error stream failed: {exc}'[:120])
+            finally:
+                process.stderr.close()
+
+        error_thread = threading.Thread(target=drain_errors, daemon=True)
+        error_thread.start()
         try:
-            error = process.stderr.read().decode('utf-8', 'replace').strip()
-        except (OSError, ValueError, AttributeError):
-            error = ''
-        # Everything that reaches here was asked to stop, so the noise a
-        # terminated arecord makes is expected. complaint() knows the
-        # difference between that and a card that went away.
-        self._error = complaint(error)
-        for stream in (process.stdout, process.stderr):
+            while True:
+                block = read(READ_BLOCK)
+                if not block:
+                    break
+                kept = block[:max(0, limit - held)]
+                if kept:
+                    with self._lock:
+                        self._blocks.append(kept)
+                        held += len(kept)
+                        self._level = voice_channel_rms(kept)
+                if held >= limit:
+                    self._signal_stop(process)
+                    # Drain/discard any remaining pipe bytes after the exact
+                    # two-minute cap instead of deadlocking a full producer.
+        except (OSError, ValueError) as exc:
+            self._error = f'capture read failed: {exc}'[:120]
+        finally:
+            # EOF is not a user stop request. Let the child publish its real
+            # exit status before resorting to cleanup, or exit 7/early failure
+            # could be overwritten by our own SIGTERM and accepted as speech.
             try:
-                stream.close()
-            except (OSError, ValueError, AttributeError):
-                pass
+                process.wait(timeout=CAPTURE_STOP_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                self._force_stop(process)
+                try:
+                    process.wait(timeout=CAPTURE_STOP_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    self._error = self._error or 'capture process could not be reaped'
+            with self._stop_lock:
+                timer, self._stop_timer = self._stop_timer, None
+            if timer is not None:
+                timer.cancel()
+                timer.join(timeout=CAPTURE_STOP_TIMEOUT)
+            error_thread.join(timeout=CAPTURE_STOP_TIMEOUT)
+            if error_thread.is_alive():
+                self._error = self._error or 'capture error stream did not close'
+            elif errors:
+                self._error = self._error or errors[0]
+            code = process.returncode
+            # arecord on the Pi exits 1 with empty stderr on requested TERM
+            # (verified with ALSA null, no microphone). Only this known status
+            # and an uncaught SIGTERM are benign; all diagnostic errors above
+            # still reject the recording, as does ANY unsolicited nonzero exit.
+            expected_stop = self._stop_requested and code in (-signal.SIGTERM, 1)
+            if code and not expected_stop:
+                self._error = self._error or f'arecord exited with status {code}'
+            # stderr's reader closes its own stream; never close under a read.
+            stream.close()
 
     def stop(self) -> bytes:
-        """End the recording and return one microphone's raw 16-bit PCM.
+        """Stop producing, drain through EOF, then return the selected channel.
 
-        The capture is stereo because the card offers nothing else; what comes
-        back here is single-channel, so every caller downstream - the level
-        measurements, the duration, ``for_recognition`` - works on one voice
-        rather than on a good microphone averaged with a noisy one.
+        A final block smaller than READ_BLOCK still contains speech. The reader
+        must finish before streams are closed or a new recording can start.
         """
-        self._terminate()
-        thread, self._thread = self._thread, None
+        process, thread = self._process, self._thread
+        self._signal_stop(process)
         if thread is not None:
-            thread.join(timeout=2)
+            thread.join(timeout=CAPTURE_STOP_TIMEOUT)
+            if thread.is_alive():
+                if process is not None and process.poll() is None:
+                    self._error = 'capture timed out; recording was not submitted'
+                self._signal_stop(process, kill=True)
+                thread.join(timeout=CAPTURE_STOP_TIMEOUT)
+            if thread.is_alive():
+                # Keep ownership for a later cleanup attempt. Both callers
+                # check error before submitting; never return partial speech.
+                self._error = 'capture did not stop; recording was not submitted'
+                return b''
+        self._process, self._thread = None, None
         with self._lock:
             return voice_channel(b''.join(self._blocks))
 
@@ -575,7 +666,7 @@ class Recorder:
     # -- what the interface asks while it runs -------------------------------
     @property
     def running(self) -> bool:
-        return self._process is not None
+        return self._thread is not None and self._thread.is_alive()
 
     @property
     def level(self) -> float:
@@ -622,13 +713,11 @@ class Player:
         except OSError as exc:
             raise AudioUnavailable(f'could not start aplay: {exc}') from exc
         self._error = None
-        self._thread = threading.Thread(target=self._feed, args=(wav,), daemon=True)
+        self._thread = threading.Thread(target=self._feed,
+                                        args=(wav, self._process), daemon=True)
         self._thread.start()
 
-    def _feed(self, wav: bytes) -> None:
-        process = self._process
-        if process is None:
-            return
+    def _feed(self, wav: bytes, process: subprocess.Popen) -> None:
         try:
             process.stdin.write(wav)
             process.stdin.close()
@@ -639,6 +728,37 @@ class Player:
             process.wait(timeout=MAX_SECONDS)
         except subprocess.TimeoutExpired:
             process.kill()
+
+    def wait(self, cancel: threading.Event | None = None) -> bool:
+        """Wait off the UI thread for this clip, without replacing it.
+
+        Opt-in for sequential playback; existing play()/stop() callers retain
+        their asynchronous behaviour. False means cancelled, failures raise.
+        Capturing the process here avoids ever waiting on a later replacement.
+        """
+        process = self._process
+        if process is None:
+            return cancel is None or not cancel.is_set()
+        deadline = time.monotonic() + MAX_SECONDS
+        while process.poll() is None:
+            if cancel is not None and cancel.is_set():
+                return False
+            if time.monotonic() >= deadline:
+                raise AudioUnavailable('aplay did not finish the clip in time')
+            if cancel is not None:
+                cancel.wait(0.02)
+            else:
+                time.sleep(0.02)
+        if cancel is not None and cancel.is_set():
+            return False
+        if process.returncode:
+            try:
+                detail = process.stderr.read(4096).decode('utf-8', 'replace').strip()
+            except (OSError, ValueError, AttributeError):
+                detail = ''
+            raise AudioUnavailable(detail.split('\n')[0][:120] or
+                                   f'aplay exited with status {process.returncode}')
+        return True
 
     @property
     def playing(self) -> bool:

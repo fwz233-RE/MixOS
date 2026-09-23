@@ -231,6 +231,24 @@ int main(int argc,char **argv){
         receive_image();request(MIX_TX_END);uint8_t p[5]={0};
         assert(mix_ota_submit_legacy(MIX_OTA_DATA,77,p,sizeof(p)));mix_ota_worker_step();
         mix_ota_reply_t r=request(MIX_TX_QUERY);assert(r.payload[2]==MIX_TX_BOOT_SELECTED&&selects==1&&ends==1&&!aborts);
+    }else if(!strcmp(argv[1],"legacy-end-failure")){
+        uint8_t begin[36];mix_put32(begin,APP_SIZE);memcpy(begin+4,digest,32);
+        assert(mix_ota_submit_legacy(MIX_OTA_BEGIN,77,begin,sizeof(begin)));mix_ota_worker_step();
+        mix_ota_reply_t reply;while(mix_ota_poll_reply(&reply))assert(reply.type==MIX_OTA_READY);
+        for(unsigned at=0;at<APP_SIZE;) {
+            unsigned n=APP_SIZE-at;if(n>508)n=508;
+            uint8_t p[512];mix_put32(p,at);memcpy(p+4,image+at,n);
+            assert(mix_ota_submit_legacy(MIX_OTA_DATA,77,p,n+4));mix_ota_worker_step();
+            while(mix_ota_poll_reply(&reply))assert(reply.type==MIX_OTA_ACK);
+            at+=n;
+        }
+        fail_end=true;
+        assert(mix_ota_submit_legacy(MIX_OTA_END,77,NULL,0));mix_ota_worker_step();
+        assert(mix_ota_poll_reply(&reply)&&reply.type==MIX_ERROR);
+        assert(reply.length>0&&reply.length<48&&reply.length==strlen(mix_ota_error()));
+        assert(!memcmp(reply.payload,mix_ota_error(),reply.length));
+        assert(!mix_ota_poll_reply(&reply)&&ends==1&&!selects&&!aborts&&boot==0);
+        assert(!mix_ota_take_worker_restart());
     }else if(!strcmp(argv[1],"legacy-late-end")){
         uint8_t begin[36];mix_put32(begin,APP_SIZE);memcpy(begin+4,digest,32);
         assert(mix_ota_submit_legacy(MIX_OTA_BEGIN,77,begin,sizeof(begin)));mix_ota_worker_step();

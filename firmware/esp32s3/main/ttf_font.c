@@ -19,29 +19,39 @@ static bool       s_ready;
 static bool       s_mapped;
 static esp_partition_mmap_handle_t s_map;
 static int        s_cur_size = -1;   // face 当前 FT_Set_Pixel_Sizes 的字号
-// The mapped partition itself. LVGL's FreeType binding opens fonts through
-// lv_fs rather than from memory, so mix_lv_font serves this same mapping as a
-// read-only file instead of mapping the partition a second time.
+// Keep the mapped partition available without a second mapping. The LVGL
+// adapter itself uses the glyph/metric accessors below, not a second face.
 static const void *s_data;
 static size_t      s_data_len;
 
 // ---------------------------------------------------------------------------
 // 字形缓存：开放寻址哈希表，key = codepoint<<8 | size（size ≤ 255）。
-// 不做淘汰——本 UI 全部页面的 (字符,字号) 组合 < 千级；万一写满就整表清空重来。
+// 位图仍限于 512 KiB；按 second-chance clock 逐出，不因一个新字形清空全表。
 // ---------------------------------------------------------------------------
 typedef struct {
     uint32_t key;        // 0 = 空槽
     int16_t  w, h;       // 位图尺寸
     int16_t  left, top;  // FreeType bitmap_left / bitmap_top
     int16_t  adv;        // 水平前进量（像素）
+    uint8_t  referenced; // 缓存命中后获得一次保留机会；占原有对齐填充
     uint8_t *bmp;        // 8bpp alpha，PSRAM
 } glyph_t;
 
-#define CACHE_CAP 2048
+#define CACHE_BITS 11
+#define CACHE_CAP (1 << CACHE_BITS)
 static glyph_t *s_cache;      // PSRAM
 static int s_cache_n;
 static size_t s_cache_bytes;
+static uint32_t s_cache_hand;
 #define GLYPH_BYTES_MAX (512u * 1024u)
+
+// One tiny metric record per supported size; no bitmaps or framebuffers here.
+// Metrics do not change until the face is released. A warm draw/measurement
+// therefore need not change FreeType's active size just to obtain its baseline.
+static struct {
+    ttf_metrics_t metrics;
+    bool valid;
+} s_metrics[256];
 
 static void cache_flush(void)
 {
@@ -51,6 +61,7 @@ static void cache_flush(void)
     }
     s_cache_n = 0;
     s_cache_bytes = 0;
+    s_cache_hand = 0;
 }
 
 static bool set_size(int size)
@@ -63,54 +74,102 @@ static bool set_size(int size)
     return true;
 }
 
-static glyph_t *cache_get(uint32_t cp, int size)
+static uint32_t cache_index(uint32_t key)
 {
-    if (!set_size(size)) return NULL;
-    if (cp == 0 || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) cp = 0xfffd;
-    uint32_t key = (cp << 8) | (uint32_t)(size & 0xFF);
-    uint32_t idx = (key * 2654435761u) & (CACHE_CAP - 1);
-    for (int probe = 0; probe < CACHE_CAP; probe++, idx = (idx + 1) & (CACHE_CAP - 1)) {
-        if (s_cache[idx].key == key) return &s_cache[idx];
-        if (s_cache[idx].key == 0) {
-            // 未命中：渲染进这个空槽
-            if (s_cache_n > CACHE_CAP - 64) {
-                ESP_LOGW(TAG, "字形缓存写满（%d），整表清空", s_cache_n);
-                cache_flush();
-                idx = (key * 2654435761u) & (CACHE_CAP - 1);
-            }
-            if (FT_Load_Char(s_face, cp, FT_LOAD_RENDER) != 0) return NULL;
-            FT_GlyphSlot g = s_face->glyph;
-            if (g->bitmap.pixel_mode != FT_PIXEL_MODE_GRAY || g->bitmap.num_grays != 256 ||
-                g->bitmap.width > INT16_MAX || g->bitmap.rows > INT16_MAX) return NULL;
-            size_t bytes = (size_t)g->bitmap.width * g->bitmap.rows;
-            if (bytes > GLYPH_BYTES_MAX) return NULL;
-            if (s_cache_bytes + bytes > GLYPH_BYTES_MAX) {
-                cache_flush();
-                idx = (key * 2654435761u) & (CACHE_CAP - 1);
-            }
-            glyph_t *e = &s_cache[idx];
-            e->key  = key;
-            e->w    = (int16_t)g->bitmap.width;
-            e->h    = (int16_t)g->bitmap.rows;
-            e->left = (int16_t)g->bitmap_left;
-            e->top  = (int16_t)g->bitmap_top;
-            e->adv  = (int16_t)(g->advance.x >> 6);
-            e->bmp  = NULL;
-            if (e->w > 0 && e->h > 0) {
-                e->bmp = heap_caps_malloc((size_t)e->w * e->h,
-                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-                if (!e->bmp) { e->key = 0; return NULL; }
-                s_cache_bytes += bytes;
-                for (int row = 0; row < e->h; row++) {
-                    memcpy(e->bmp + row * e->w,
-                           g->bitmap.buffer + row * g->bitmap.pitch, e->w);
-                }
-            }
-            s_cache_n++;
-            return e;
+    // Use the high bits: the low 11 bits of cp<<8 leave only eight initial
+    // buckets per size, creating long probe chains for Chinese text.
+    return (key * 2654435761u) >> (32 - CACHE_BITS);
+}
+
+static void cache_remove(uint32_t idx)
+{
+    glyph_t *e = &s_cache[idx];
+    s_cache_bytes -= (size_t)e->w * e->h;
+    free(e->bmp);
+    memset(e, 0, sizeof(*e));
+    s_cache_n--;
+
+    // Close the probe-chain hole instead of accumulating tombstones. Only
+    // metadata moves: surviving bitmap allocations keep their addresses.
+    uint32_t hole = idx;
+    for (int probe = 0; probe < CACHE_CAP - 1; probe++) {
+        idx = (idx + 1) & (CACHE_CAP - 1);
+        if (!s_cache[idx].key) break;
+        uint32_t home = cache_index(s_cache[idx].key);
+        if (((idx - home) & (CACHE_CAP - 1)) >=
+            ((idx - hole) & (CACHE_CAP - 1))) {
+            s_cache[hole] = s_cache[idx];
+            memset(&s_cache[idx], 0, sizeof(glyph_t));
+            hole = idx;
         }
     }
-    return NULL;
+}
+
+static bool cache_evict_one(void)
+{
+    // At most two revolutions: first clear reference bits, then choose a
+    // victim. This is bounded even when every resident glyph was just used.
+    for (int probe = 0; probe < 2 * CACHE_CAP; probe++) {
+        uint32_t idx = s_cache_hand;
+        s_cache_hand = (idx + 1) & (CACHE_CAP - 1);
+        glyph_t *e = &s_cache[idx];
+        if (!e->key) continue;
+        if (e->referenced) { e->referenced = 0; continue; }
+        cache_remove(idx);
+        return true;
+    }
+    return false;
+}
+
+static glyph_t *cache_get(uint32_t cp, int size)
+{
+    if (!s_ready || size <= 0 || size > 255) return NULL;
+    if (cp == 0 || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) cp = 0xfffd;
+    uint32_t key = (cp << 8) | (uint32_t)size;
+    uint32_t idx = cache_index(key);
+    for (int probe = 0; probe < CACHE_CAP; probe++, idx = (idx + 1) & (CACHE_CAP - 1)) {
+        if (s_cache[idx].key == key) {
+            s_cache[idx].referenced = 1;
+            return &s_cache[idx];
+        }
+        if (!s_cache[idx].key) break;
+    }
+
+    // A hit above never touches the face. Only rasterization needs its size.
+    if (!set_size(size) || FT_Load_Char(s_face, cp, FT_LOAD_RENDER) != 0) return NULL;
+    FT_GlyphSlot g = s_face->glyph;
+    if (g->bitmap.pixel_mode != FT_PIXEL_MODE_GRAY || g->bitmap.num_grays != 256 ||
+        g->bitmap.width > INT16_MAX || g->bitmap.rows > INT16_MAX) return NULL;
+    size_t bytes = (size_t)g->bitmap.width * g->bitmap.rows;
+    if (bytes > GLYPH_BYTES_MAX) return NULL;
+    while (s_cache_n >= CACHE_CAP - 64 || s_cache_bytes > GLYPH_BYTES_MAX - bytes) {
+        if (!cache_evict_one()) return NULL;
+    }
+
+    // Eviction may have moved probe-chain metadata; locate the empty slot again.
+    idx = cache_index(key);
+    while (s_cache[idx].key) idx = (idx + 1) & (CACHE_CAP - 1);
+    uint8_t *bmp = NULL;
+    if (bytes) {
+        bmp = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!bmp) return NULL; // Do not publish a partial entry on failure.
+        for (unsigned row = 0; row < g->bitmap.rows; row++) {
+            memcpy(bmp + (size_t)row * g->bitmap.width,
+                   g->bitmap.buffer + (ptrdiff_t)row * g->bitmap.pitch, g->bitmap.width);
+        }
+    }
+    glyph_t *e = &s_cache[idx];
+    e->key  = key;
+    e->w    = (int16_t)g->bitmap.width;
+    e->h    = (int16_t)g->bitmap.rows;
+    e->left = (int16_t)g->bitmap_left;
+    e->top  = (int16_t)g->bitmap_top;
+    e->adv  = (int16_t)(g->advance.x >> 6);
+    e->referenced = 0; // One-off glyphs do not displace repeatedly used text.
+    e->bmp = bmp;
+    s_cache_n++;
+    s_cache_bytes += bytes;
+    return e;
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +211,7 @@ void ttf_font_deinit(void)
     s_data = NULL;
     s_data_len = 0;
     s_cur_size = -1;
+    memset(s_metrics, 0, sizeof(s_metrics));
 }
 
 esp_err_t ttf_font_init(void)
@@ -229,13 +289,20 @@ const void *ttf_font_data(size_t *len)
 
 bool ttf_font_metrics(int size, ttf_metrics_t *out)
 {
-    if (!out || !set_size(size)) return false;
+    if (!out || !s_ready || size <= 0 || size > 255) return false;
+    if (s_metrics[size].valid) {
+        *out = s_metrics[size].metrics;
+        return true;
+    }
+    if (!set_size(size)) return false;
     // Rounded up: a line box one pixel short clips descenders on every row.
     out->ascent      = (int16_t)((s_face->size->metrics.ascender + 63) / 64);
     out->descent     = (int16_t)((-s_face->size->metrics.descender + 63) / 64);
     out->line_height = (int16_t)((s_face->size->metrics.height + 63) / 64);
     if (out->line_height < out->ascent + out->descent)
         out->line_height = (int16_t)(out->ascent + out->descent);
+    s_metrics[size].metrics = *out;
+    s_metrics[size].valid = true;
     return true;
 }
 
@@ -268,23 +335,45 @@ static inline uint16_t blend565(uint16_t dst, uint16_t fg, uint8_t a)
     return (uint16_t)((r << 11) | (g << 5) | b);
 }
 
-// Cell rendering uses font ascent/descent for a shared baseline, not a UI
-// offset tied to one font. Each side of the baseline fits its metric extent;
-// exceptional outlines beyond those metrics still fit without moving baseline.
-// Horizontal bounds include bearings AND advance. Max-alpha area sampling keeps
-// thin edge strokes when a proportional outline must shrink to one terminal cell.
+// Terminal cells are deliberately a little stronger than ordinary UI text.
+// FreeType's gray coverage is correct for large UI labels, but at 20/26 px a
+// cell's max-alpha resampling leaves too many edge pixels in the middle-gray
+// range. Keep antialiasing and lift coverage only on this terminal path; the
+// normal ttf_draw_text() path remains unchanged.
+#define CELL_ALPHA_BOOST_PERCENT 20u
+static inline uint8_t cell_alpha_boost(uint8_t alpha)
+{
+    unsigned boosted = (unsigned)alpha +
+                       ((unsigned)alpha * CELL_ALPHA_BOOST_PERCENT + 99u) / 100u;
+    return (uint8_t)(boosted > 255u ? 255u : boosted);
+}
+
+// Floor division is needed above the baseline, where source coordinates are
+// negative. C's truncation toward zero would lose the topmost fractional row.
+static int cell_floor_div(int n, int d)
+{
+    return n >= 0 ? n / d : -((-n + d - 1) / d);
+}
+
+// Font ascent/descent place a shared baseline, but their whitespace must not
+// squash the bitmap. Fit actual ink extents above/below that baseline and the
+// horizontal bearing/advance/bold extent using ONE rational scale (never grow).
+// Keeping the ratio through sampling, rather than rounding width and height
+// independently, preserves proportions even for small/exceptional outlines.
+// Max-alpha area sampling preserves every thin edge stroke while shrinking.
 void ttf_draw_cell(uint16_t *fb, int fb_w, int fb_h, int x, int y,
                    int cell_w, int cell_h, int size, uint16_t color,
                    uint32_t cp, bool bold)
 {
+    ttf_metrics_t metrics;
     if (!fb || fb_w <= 0 || fb_h <= 0 || cell_w <= 0 || cell_w > 64 ||
         cell_h < 2 || cell_h > 64 || x >= fb_w || y >= fb_h ||
-        x <= -cell_w || y <= -cell_h || !set_size(size)) return;
+        x <= -cell_w || y <= -cell_h || !ttf_font_metrics(size, &metrics)) return;
     if (cp == 0 || cp == ' ') return;
     glyph_t *e = cache_get(cp, size);
     if (!e || !e->bmp || e->w <= 0 || e->h <= 0) return;
-    int ascent = (int)((s_face->size->metrics.ascender + 63) / 64);
-    int descent = (int)((-s_face->size->metrics.descender + 63) / 64);
+    int ascent = metrics.ascent;
+    int descent = metrics.descent;
     if (ascent < 1) ascent = 1;
     if (descent < 1) descent = 1;
     int line_h = ascent + descent;
@@ -292,31 +381,38 @@ void ttf_draw_cell(uint16_t *fb, int fb_w, int fb_h, int x, int y,
     int baseline = (ascent * draw_h + line_h / 2) / line_h;
     if (baseline < 1) baseline = 1;
     if (baseline >= draw_h) baseline = draw_h - 1;
-    int above = e->top > ascent ? e->top : ascent;
-    int below = e->h - e->top > descent ? e->h - e->top : descent;
+    baseline += (cell_h - draw_h) / 2;
     int xmin = e->left < 0 ? e->left : 0;
     int xmax = e->left + e->w + (bold ? 1 : 0);
     if (xmax < e->adv) xmax = e->adv;
     int natural_w = xmax - xmin;
     if (natural_w <= 0) return;
-    int draw_w = natural_w < cell_w ? natural_w : cell_w;
-    int left = (cell_w - draw_w) / 2, top = (cell_h - draw_h) / 2;
-    for (int dy = 0; dy < draw_h; dy++) {
-        int fy = y + top + dy;
+
+    int scale_n = 1, scale_d = 1;
+    if (natural_w > cell_w) { scale_n = cell_w; scale_d = natural_w; }
+    if (e->top > 0 && baseline * scale_d < e->top * scale_n) {
+        scale_n = baseline; scale_d = e->top;
+    }
+    int below = e->h - e->top;
+    if (below > 0 && (cell_h - baseline) * scale_d < below * scale_n) {
+        scale_n = cell_h - baseline; scale_d = below;
+    }
+    int draw_w = (natural_w * scale_n + scale_d - 1) / scale_d;
+    int left = (cell_w - draw_w) / 2;
+    int first_y = baseline + cell_floor_div(-e->top * scale_n, scale_d);
+    int last_y = baseline - cell_floor_div(-below * scale_n, scale_d);
+    for (int dy = first_y; dy < last_y; dy++) {
+        int64_t fy = (int64_t)y + dy;
         if (fy < 0 || fy >= fb_h) continue;
-        int region_y = dy < baseline ? dy : dy - baseline;
-        int span = dy < baseline ? above : below;
-        int pixels = dy < baseline ? baseline : draw_h - baseline;
-        int origin = dy < baseline ? e->top - above : e->top;
-        int sy0 = origin + region_y * span / pixels;
-        int sy1 = origin + ((region_y + 1) * span + pixels - 1) / pixels;
+        int sy0 = e->top + cell_floor_div((dy - baseline) * scale_d, scale_n);
+        int sy1 = e->top - cell_floor_div(-(dy + 1 - baseline) * scale_d, scale_n);
         if (sy0 < 0) sy0 = 0;
         if (sy1 > e->h) sy1 = e->h;
         for (int dx = 0; dx < draw_w; dx++) {
-            int fx = x + left + dx;
+            int64_t fx = (int64_t)x + left + dx;
             if (fx < 0 || fx >= fb_w) continue;
-            int sx0 = xmin - e->left + dx * natural_w / draw_w;
-            int sx1 = xmin - e->left + ((dx + 1) * natural_w + draw_w - 1) / draw_w;
+            int sx0 = xmin - e->left + dx * scale_d / scale_n;
+            int sx1 = xmin - e->left + ((dx + 1) * scale_d + scale_n - 1) / scale_n;
             if (sx0 < 0) sx0 = 0;
             if (sx1 > e->w + (bold ? 1 : 0)) sx1 = e->w + (bold ? 1 : 0);
             uint8_t alpha = 0;
@@ -330,18 +426,21 @@ void ttf_draw_cell(uint16_t *fb, int fb_w, int fb_h, int x, int y,
             }
             if (alpha) {
                 uint16_t *dst = fb + (size_t)fy * fb_w + fx;
-                *dst = blend565(*dst, color, alpha);
+                *dst = blend565(*dst, color, cell_alpha_boost(alpha));
             }
         }
     }
 }
 
-int ttf_draw_text(uint16_t *fb, int fb_w, int fb_h,
-                  int x, int y, int size, uint16_t color, const char *utf8)
+static int ttf_draw_text_impl(uint16_t *fb, int fb_w, int fb_h,
+                               int clip_y0, int clip_y1, int x, int y, int size,
+                               uint16_t color, const char *utf8)
 {
-    if (!fb || !utf8 || fb_w <= 0 || fb_h <= 0 || !set_size(size)) return 0;
-    // y 是行顶：基线 = y + ascender（该字号下）
-    int base_y = y + (int)(s_face->size->metrics.ascender >> 6);
+    ttf_metrics_t metrics;
+    if (!fb || !utf8 || fb_w <= 0 || fb_h <= 0 || clip_y0 < 0 ||
+        clip_y1 < clip_y0 || clip_y1 > fb_h || !ttf_font_metrics(size, &metrics)) return 0;
+    /* y 是行顶：基线 = y + ascender（该字号下） */
+    int base_y = y + metrics.ascent;
     int pen_x = x;
     for (const char *p = utf8; *p; ) {
         uint32_t cp = utf8_next(&p);
@@ -351,9 +450,9 @@ int ttf_draw_text(uint16_t *fb, int fb_w, int fb_h,
         int gy0 = base_y - e->top;
         for (int row = 0; row < e->h; row++) {
             int fy = gy0 + row;
-            if (fy < 0 || fy >= fb_h) continue;
+            if (fy < clip_y0 || fy >= clip_y1) continue;
             const uint8_t *src = e->bmp + row * e->w;
-            uint16_t *dst = fb + fy * fb_w;
+            uint16_t *dst = fb + (size_t)fy * fb_w;
             for (int col = 0; col < e->w; col++) {
                 int fx = gx0 + col;
                 if (fx < 0 || fx >= fb_w) continue;
@@ -366,9 +465,22 @@ int ttf_draw_text(uint16_t *fb, int fb_w, int fb_h,
     return pen_x - x;
 }
 
+int ttf_draw_text(uint16_t *fb, int fb_w, int fb_h,
+                  int x, int y, int size, uint16_t color, const char *utf8)
+{
+    return ttf_draw_text_impl(fb, fb_w, fb_h, 0, fb_h, x, y, size, color, utf8);
+}
+
+int ttf_draw_text_clipped(uint16_t *fb, int fb_w, int fb_h,
+                          int clip_y0, int clip_y1, int x, int y, int size,
+                          uint16_t color, const char *utf8)
+{
+    return ttf_draw_text_impl(fb, fb_w, fb_h, clip_y0, clip_y1, x, y, size, color, utf8);
+}
+
 int ttf_text_width(int size, const char *utf8)
 {
-    if (!utf8 || !set_size(size)) return 0;
+    if (!utf8 || !s_ready || size <= 0 || size > 255) return 0;
     int w = 0;
     for (const char *p = utf8; *p; ) {
         uint32_t cp = utf8_next(&p);

@@ -25,12 +25,19 @@ static bool emit(uint8_t r, uint8_t c, bool repeat) {
     bool shift = down(4, 0) || down(4, 10), ctrl = down(5, 1), alt = down(5, 2);
     if (r == 0) {
         if (repeat) return false;
-        static const uint8_t actions[11] = {0,MIX_KEY_HOME,MIX_KEY_VOLUME_UP,MIX_KEY_VOLUME_DOWN,0,0,0,MIX_KEY_BRIGHT_UP,MIX_KEY_BRIGHT_DOWN,MIX_KEY_BACKLIGHT,0};
+        // Screen keys, left to right: lock, volume -/+, brightness -/+, backlight.
+        static const uint8_t actions[11] = {0,MIX_KEY_LOCK,MIX_KEY_VOLUME_DOWN,MIX_KEY_VOLUME_UP,0,0,0,MIX_KEY_BRIGHT_DOWN,MIX_KEY_BRIGHT_UP,MIX_KEY_BACKLIGHT,0};
         if (c == 9 && (fn || sym)) return false; // STM32-local 3-second rescue
         action(actions[c]); return false;
     }
     if (space(r, c) && fn) {
         if (!repeat) action(MIX_KEY_BACKLIGHT);
+        return false;
+    }
+    if (space(r, c) && shift && !ctrl && !alt && !sym) {
+        /* A repeat of an ordinary held Space must never become a shortcut
+         * when Shift is pressed later. Only a new logical Space press toggles. */
+        if (!repeat) action(MIX_KEY_IME_TOGGLE);
         return false;
     }
     uint8_t bytes[24];

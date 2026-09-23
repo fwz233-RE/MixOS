@@ -19,6 +19,7 @@ esp_err_t mix_watchdog_task_begin(mix_health_task_t r){(void)r;return ESP_OK;}
 esp_err_t mix_watchdog_task_reset(mix_health_task_t r){(void)r;return ESP_OK;}
 esp_err_t mix_watchdog_task_end(mix_health_task_t r){(void)r;return ESP_OK;}
 void vTaskDelete(void *p){(void)p;}
+size_t mix_ui_performance(char *out,size_t capacity){const char *text="{\"schema\":1}";size_t n=strlen(text);if(capacity<=n)return 0;memcpy(out,text,n+1);return n;}
 const uint16_t *mix_ui_framebuffer(size_t *bytes,uint16_t *w,uint16_t *h){if(bytes)*bytes=0;if(w)*w=0;if(h)*h=0;return NULL;}
 #ifndef MIX_LINK_IO_TEST
 void vTaskDelay(unsigned n){(void)n;}
@@ -193,6 +194,35 @@ static void tick(uint32_t t){now=t;rx_time=t;mix_link_tick(t,&view);}
 
 int main(int argc,char **argv){
     assert(argc==2);setup();
+    /* An app-root exit is a validated protocol event, never a disconnected
+     * session, stale id/epoch, malformed EXIT, or an unsuccessful launch. */
+    assert(mix_link_open_app(MIX_APP_NOTES));uint32_t exited_session=session;
+    opened(session);xQueueReset(controlq);
+    uint32_t exit_serial=terminal_exit_serial;
+    frame(MIX_CH_TERMINAL,MIX_EXIT,exited_session+1,4,epoch,++seq);
+    frame(MIX_CH_TERMINAL,MIX_EXIT,exited_session,4,epoch+1,++seq);
+    frame(MIX_CH_TERMINAL,MIX_EXIT,exited_session,0,epoch,++seq);
+    assert(terminal_open&&terminal_exit_serial==exit_serial);
+    mix_frame_t failed={.channel=MIX_CH_TERMINAL,.type=MIX_EXIT,.session=session,
+        .length=4,.epoch=epoch,.sequence=++seq};mix_put32(failed.payload,1);
+    assert(xQueueSend(rxq,&failed,0));mix_link_tick(now,&view);
+    assert(!terminal_open&&view.terminal_exit_serial==exit_serial);
+    assert(mix_link_open_app(MIX_APP_NOTES));opened(session);xQueueReset(controlq);
+    exited_session=session;
+    frame(MIX_CH_TERMINAL,MIX_EXIT,exited_session,4,epoch,++seq);
+    assert(!terminal_open&&view.terminal_exit_serial==exit_serial+1&&view.terminal_exit_app==MIX_APP_NOTES);
+    frame(MIX_CH_TERMINAL,MIX_EXIT,exited_session,4,epoch,++seq);
+    assert(view.terminal_exit_serial==exit_serial+1);
+    setup();
+    /* Performance is read-only and requires an empty, nonzero-session request. */
+    frame(MIX_CH_MAINTENANCE,MIX_UI_PERF_REQUEST,99,1,epoch,++seq);
+    frame(MIX_CH_MAINTENANCE,MIX_UI_PERF_REQUEST,0,0,epoch,++seq);
+    assert(!controlq->count);
+    send(MIX_UI_PERF_REQUEST,99);
+    mix_frame_t perf;assert(xQueueReceive(controlq,&perf,0));
+    assert(perf.type==MIX_UI_PERF_RESPONSE&&perf.session==99&&perf.length==12);
+    assert(!memcmp(perf.payload,"{\"schema\":1}",12));
+    assert(!controlq->count&&!boot_request&&!restart_request&&!pending_update&&!ota_session&&!opening);
     if(!strcmp(argv[1],"automatic")){
         /* Readiness and ENTER_BOOT succeed with zero UI input. */
         ready(55);assert(!mix_link_open_app(MIX_APP_SHELL));send(MIX_ENTER_BOOT,55);

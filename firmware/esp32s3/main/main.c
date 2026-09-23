@@ -30,6 +30,7 @@
 #include "usb_device_uac.h"
 #include "mix_view.h"
 #include "mix_ui.h"
+#include "mix_present.h"
 #include "mix_terminal.h"
 #include "ttf_font.h"
 #include "mix_keyboard.h"
@@ -50,8 +51,8 @@ static bool codec_ready,usb_audio_allowed,device_service_enabled;
 static esp_err_t audio_boot_error;
 static bool link_initialized,usb_requested,ota_worker_ready;
 static bool maintenance_mode;
-static portMUX_TYPE rgb_lock=portMUX_INITIALIZER_UNLOCKED;
-static uint32_t rgb_vsyncs,rgb_frames;
+static DRAM_ATTR portMUX_TYPE rgb_lock=portMUX_INITIALIZER_UNLOCKED;
+static DRAM_ATTR uint32_t rgb_vsyncs,rgb_frames;
 /* ISR counters establish scanout activity, not a physical LCD self-test. */
 static bool rgb_vsync(esp_lcd_panel_handle_t p,const esp_lcd_rgb_panel_event_data_t *e,void *ctx){
     (void)p;(void)e;(void)ctx;
@@ -61,7 +62,7 @@ static bool rgb_vsync(esp_lcd_panel_handle_t p,const esp_lcd_rgb_panel_event_dat
 static bool rgb_frame_complete(esp_lcd_panel_handle_t p,const esp_lcd_rgb_panel_event_data_t *e,void *ctx){
     (void)p;(void)e;(void)ctx;
     portENTER_CRITICAL_ISR(&rgb_lock);rgb_frames++;portEXIT_CRITICAL_ISR(&rgb_lock);
-    return false;
+    return mix_present_frame_complete();
 }
 static bool rgb_progress_healthy(uint32_t now){
     static uint32_t seen_vsync,seen_frame,vsync_at,frame_at;
@@ -84,6 +85,73 @@ static i2c_master_dev_handle_t add_sensor(uint8_t address){
     if(probe!=ESP_OK){ESP_LOGW(TAG,"I2C 设备 0x%02X 无应答: %s",address,esp_err_to_name(probe));return NULL;}
     return mix_i2c_add_device(address,I2C_STANDARD_HZ);
 }
+/* Main task is the only owner of tp. Never discard a handle if removal
+ * fails, and never touch LCD SPI or audio pins during touch recovery. */
+static esp_err_t recover_touch(void){
+    esp_err_t e;
+    if(tp){
+        if((e=mix_i2c_rm_device(tp))!=ESP_OK)return e;
+        tp=NULL;
+    }
+    if((e=aw9523_gt911_reset(aw))!=ESP_OK)return e;
+    return gt911_init(&tp); /* probes both addresses and reloads volatile config */
+}
+/* Touch sampling state: main task only, including the present wait hook.
+ * Keep every edge and movement in order. A single latest-point mailbox would
+ * lose a short swipe's down/up pair, or turn a drag into a click. */
+#define TOUCH_QUEUE_CAP 32u
+typedef struct { int x,y; bool down,cancel; } touch_event_t;
+static touch_event_t touch_queue[TOUCH_QUEUE_CAP];
+static unsigned touch_read_at,touch_count;
+static int touch_x,touch_y,tp_errors;
+static bool tp_down;
+static uint32_t last_tp_retry,last_tp_poll;
+static void touch_enqueue(touch_event_t event){
+    if(touch_count==TOUCH_QUEUE_CAP){
+        /* A stalled owner must cancel, not replay an incomplete gesture.
+         * Retain the current real frame so a real release can end quarantine. */
+        touch_read_at=0;touch_count=1;
+        touch_queue[0]=(touch_event_t){.cancel=true};
+    }
+    touch_queue[(touch_read_at+touch_count)%TOUCH_QUEUE_CAP]=event;
+    ++touch_count;
+}
+static void sample_touch(uint32_t ms,bool quick){
+    if(!tp||tp_errors>=3||(uint32_t)(ms-last_tp_poll)<16)return;
+    last_tp_poll=ms;
+    gt911_touch_t t={0};
+    esp_err_t e=quick?gt911_try_read(tp,&t):gt911_read(tp,&t);
+    if(e==ESP_OK){
+        tp_errors=0;
+        if(t.count){touch_x=t.x;touch_y=t.y;}
+        tp_down=t.count>0;
+        touch_enqueue((touch_event_t){touch_x,touch_y,tp_down,false});
+    }else if(e==ESP_ERR_NOT_FOUND){
+        /* Idle/bus busy is not an up event. A held finger stays held. */
+        tp_errors=0;
+    }else{
+        touch_x=touch_y=0;tp_down=false;
+        touch_enqueue((touch_event_t){.cancel=true});
+        ++tp_errors;
+    }
+}
+static void touch_wait_sample(void *ctx){
+    (void)ctx;
+    /* No recovery, UI dispatch, logging or drawing in the wait hook. */
+    sample_touch(clock_ms(),true);
+}
+static void dispatch_touch(void){
+    /* Pop before dispatch: home-card feedback may itself present and sample.
+     * Limit work to the entry count so input cannot starve link/OTA progress. */
+    unsigned budget=touch_count;
+    while(budget--&&touch_count){
+        touch_event_t e=touch_queue[touch_read_at];
+        touch_read_at=(touch_read_at+1)%TOUCH_QUEUE_CAP;--touch_count;
+        if(e.cancel)mix_ui_touch_cancel();else mix_ui_touch(e.x,e.y,e.down);
+    }
+}
+/* End touch sampling state. */
+
 static esp_err_t start_board(void){
     i2c_master_bus_config_t c={.i2c_port=-1,.sda_io_num=PIN_I2C_SDA,.scl_io_num=PIN_I2C_SCL,
         .clk_source=I2C_CLK_SRC_DEFAULT,.glitch_ignore_cnt=7,.flags.enable_internal_pullup=true};
@@ -99,15 +167,17 @@ static esp_err_t start_board(void){
     if((e=lcd_jd9168s_spi_init())!=ESP_OK)return e;
     if(aw9523_gt911_reset(aw)==ESP_OK)gt911_init(&tp);
     /* GPIO47/48 are now free for I2S. Never re-init panel SPI while audio runs. */
+    _Static_assert(LCD_V_RES % LCD_BOUNCE_LINES == 0,
+                   "IDF requires whole bounce buffers per frame");
     esp_lcd_rgb_panel_config_t rgb={
         .clk_src=LCD_CLK_SRC_PLL240M,
         .timings={.pclk_hz=LCD_PCLK_HZ,.h_res=LCD_H_RES,.v_res=LCD_V_RES,
             .hsync_front_porch=LCD_HFP,.hsync_pulse_width=LCD_HSYNC_W,.hsync_back_porch=LCD_HBP,
             .vsync_front_porch=LCD_VFP,.vsync_pulse_width=LCD_VSYNC_W,.vsync_back_porch=LCD_VBP},
-        /* The display driver keeps two scanout buffers so the LCD controller
-         * never scans from the same memory that the UI is repainting. The UI
-         * owns its separate canvas and presents changed rows through the driver. */
-        .data_width=16,.bits_per_pixel=16,.num_fbs=2,.bounce_buffer_size_px=LCD_H_RES*16,
+        /* mix_present explicitly fills the idle driver buffer and waits for
+         * the bounce-frame callback before reusing the old one. Merely setting
+         * num_fbs=2 does not synchronize copies from an external UI canvas. */
+        .data_width=16,.bits_per_pixel=16,.num_fbs=2,.bounce_buffer_size_px=LCD_H_RES*LCD_BOUNCE_LINES,
         .hsync_gpio_num=PIN_LCD_HSYNC,.vsync_gpio_num=PIN_LCD_VSYNC,.de_gpio_num=PIN_LCD_DE,
         .pclk_gpio_num=PIN_LCD_PCLK,.disp_gpio_num=-1,
         .data_gpio_nums={PIN_LCD_B3,PIN_LCD_B4,PIN_LCD_B5,PIN_LCD_B6,PIN_LCD_B7,
@@ -120,11 +190,12 @@ static esp_err_t start_board(void){
     return esp_lcd_panel_init(panel);
 }
 static esp_err_t apply_brightness(int step){
-    brightness+=step;if(brightness<1)brightness=1;if(brightness>10)brightness=10;
-    esp_err_t e=ledc_set_duty(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_0,(uint32_t)brightness*1023/10);
+    int wanted=brightness+step;if(wanted<1)wanted=1;if(wanted>10)wanted=10;
+    uint32_t duty=mix_ui_display_awake()?(uint32_t)wanted*1023/10:0;
+    esp_err_t e=ledc_set_duty(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_0,duty);
     if(e==ESP_OK)e=ledc_update_duty(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_0);
-    /* Dropping these used to make the brightness keys look dead with no clue why. */
-    if(e!=ESP_OK)ESP_LOGW(TAG,"Backlight duty update failed: %s",esp_err_to_name(e));
+    if(e==ESP_OK)brightness=wanted;
+    else ESP_LOGW(TAG,"Backlight duty update failed: %s",esp_err_to_name(e));
     return e;
 }
 static esp_err_t start_backlight(void){
@@ -310,22 +381,83 @@ static void device_task(void *arg){
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
+static bool light_feedback_pending;
+static int light_feedback_target, saved_keyboard_light=-1;
+static uint32_t light_feedback_at;
+static void adjust_brightness(int step){
+    esp_err_t e=apply_brightness(step);
+    mix_ui_feedback(MIX_UI_BRIGHTNESS,e==ESP_OK?brightness*10:-1);
+}
+static void adjust_volume(int step){
+    int wanted=volume+step;if(wanted<0)wanted=0;if(wanted>100)wanted=100;
+    esp_err_t e=audio_set_volume(wanted);
+    if(e==ESP_OK){volume=wanted;mix_ui_volume(volume);}
+    mix_ui_feedback(MIX_UI_VOLUME,e==ESP_OK?volume:-1);
+}
+static void adjust_keyboard_light(void){
+    int level=mix_keyboard_backlight_level();
+    if(level<0){mix_ui_feedback(MIX_UI_KEYBOARD_LIGHT,-1);return;}
+    light_feedback_target=((light_feedback_pending?light_feedback_target:level)+1)%9;
+    /* Absolute targets preserve rapid presses even when the next device
+     * report still describes the previous command. */
+    mix_keyboard_backlight_set((uint8_t)light_feedback_target);
+    light_feedback_pending=true;light_feedback_at=clock_ms();
+}
+static void sync_local_lock(void){
+    static bool previous_lock,previous_awake=true;
+    bool is_locked=mix_ui_locked(),awake=mix_ui_display_awake();
+    if(is_locked!=previous_lock){
+        mix_keyboard_reset_input();light_feedback_pending=false;
+        if(is_locked){saved_keyboard_light=mix_keyboard_backlight_level();mix_keyboard_backlight_set(0);}
+        else if(saved_keyboard_light>=0)mix_keyboard_backlight_set((uint8_t)saved_keyboard_light);
+        previous_lock=is_locked;
+    }
+    /* Reconnecting a keyboard while locked must not light it back up. */
+    if(is_locked&&mix_keyboard_backlight_level()>0)mix_keyboard_backlight_set(0);
+    if(awake!=previous_awake&&(!awake||mix_ui_draw_healthy())){
+        if(apply_brightness(0)==ESP_OK)previous_awake=awake;
+    }
+    if(light_feedback_pending&&!is_locked){
+        int observed=mix_keyboard_backlight_level();
+        if(observed==light_feedback_target){mix_ui_feedback(MIX_UI_KEYBOARD_LIGHT,observed);light_feedback_pending=false;}
+        else if(observed<0||(uint32_t)(clock_ms()-light_feedback_at)>800){
+            mix_ui_feedback(MIX_UI_KEYBOARD_LIGHT,-1);light_feedback_pending=false;
+        }
+    }
+}
 static void key_event(int action,const uint8_t *bytes,size_t len,void *ctx){
     (void)ctx;
+    if(mix_ui_locked()&&action!=MIX_KEY_LOCK)return;
     switch(action){
     case MIX_KEY_TEXT:
         if(view.maintenance_busy)mix_ui_key(bytes,len);
         else if(mix_ui_terminal_visible()&&view.terminal_open){if(!mix_link_input(bytes,len))mix_ui_notice("Terminal input unavailable");}
         else mix_ui_key(bytes,len);break;
-    case MIX_KEY_HOME:if(!view.maintenance_busy){mix_ui_home_toggle();mix_keyboard_reset_input();}break;
-    case MIX_KEY_BRIGHT_UP:apply_brightness(1);break;
-    case MIX_KEY_BRIGHT_DOWN:apply_brightness(-1);break;
-    case MIX_KEY_BACKLIGHT:mix_keyboard_backlight_step();break;
+    case MIX_KEY_IME_TOGGLE:
+        if(!view.maintenance_busy&&!view.ota_state&&view.linux_online&&
+           mix_ui_terminal_visible()&&view.terminal_open&&view.running_app==MIX_APP_NOTES){
+            static const uint8_t toggle[]=MIX_IME_TOGGLE_SEQUENCE;
+            if(!mix_link_input(toggle,sizeof(toggle)-1))mix_ui_notice("Terminal input unavailable");
+        }
+        break;
+    case MIX_KEY_LOCK:
+        /* Lock screen removed: keep the physical key reserved and inert. */
+        break;
+    case MIX_KEY_BRIGHT_UP:adjust_brightness(1);break;
+    case MIX_KEY_BRIGHT_DOWN:adjust_brightness(-1);break;
+    case MIX_KEY_BACKLIGHT:adjust_keyboard_light();break;
     case MIX_KEY_VOLUME_UP:case MIX_KEY_VOLUME_DOWN:
-        volume+=action==MIX_KEY_VOLUME_UP?5:-5;if(volume<0)volume=0;if(volume>100)volume=100;
-        audio_set_volume(volume);
-        mix_ui_volume(volume);break;
+        adjust_volume(action==MIX_KEY_VOLUME_UP?5:-5);break;
     }
+}
+static void app_back(int app){
+    /* A delayed tap must never reach another app or a hidden session. */
+    if(app!=MIX_APP_NOTES&&app!=MIX_APP_TRANSLATE&&app!=MIX_APP_SHELL)return;
+    if(view.maintenance_busy||view.ota_state||mix_ui_locked()||
+       !mix_ui_terminal_visible()||!view.linux_online||!view.terminal_open||
+       view.running_app!=app)return;
+    uint8_t back=app==MIX_APP_NOTES?0x11:0x1b;
+    if(!mix_link_input(&back,1))mix_ui_notice("Terminal input unavailable");
 }
 static void actions(void){mix_action_t a;
     while(mix_ui_take_action(&a))switch(a.kind){
@@ -334,18 +466,18 @@ static void actions(void){mix_action_t a;
     case MIX_ACTION_TERMINAL_OPEN:if(!mix_link_open_app(MIX_APP_SHELL))mix_ui_notice("Linux is offline");break;
     case MIX_ACTION_TERMINAL_CLOSE:mix_link_close_terminal();break;
     case MIX_ACTION_TERM_GEOMETRY:mix_link_resize(mix_terminal_cols(),mix_terminal_rows());break;
+    case MIX_ACTION_APP_BACK:app_back(a.value);break;
     case MIX_ACTION_NET_SCAN:if(!mix_link_net_scan())mix_ui_notice("Network request unavailable");break;
     case MIX_ACTION_NET_CONNECT:
         if(!mix_link_net_connect(mix_ui_net_ssid(),mix_ui_net_passphrase()))mix_ui_notice("Network request unavailable");
         break;
     case MIX_ACTION_NET_FORGET:
         if(!mix_link_net_forget(mix_ui_net_ssid()))mix_ui_notice("Network request unavailable");break;
-    case MIX_ACTION_BRIGHT_UP:apply_brightness(1);break;
-    case MIX_ACTION_BRIGHT_DOWN:apply_brightness(-1);break;
-    case MIX_ACTION_KBD_BACKLIGHT:mix_keyboard_backlight_step();break;
+    case MIX_ACTION_BRIGHT_UP:adjust_brightness(1);break;
+    case MIX_ACTION_BRIGHT_DOWN:adjust_brightness(-1);break;
+    case MIX_ACTION_KBD_BACKLIGHT:adjust_keyboard_light();break;
     case MIX_ACTION_VOLUME_UP:case MIX_ACTION_VOLUME_DOWN:
-        volume+=a.kind==MIX_ACTION_VOLUME_UP?5:-5;if(volume<0)volume=0;if(volume>100)volume=100;
-        audio_set_volume(volume);break;
+        adjust_volume(a.kind==MIX_ACTION_VOLUME_UP?5:-5);break;
     case MIX_ACTION_JOB_START:mix_link_job(true);break;
     case MIX_ACTION_JOB_CANCEL:mix_link_job(false);break;
     case MIX_ACTION_INPUT_RESET:mix_keyboard_reset_input();break;
@@ -392,7 +524,11 @@ void app_main(void){
     gpio_config_t button={.pin_bit_mask=1ULL<<PIN_BOOT_BTN,.mode=GPIO_MODE_INPUT,.pull_up_en=GPIO_PULLUP_ENABLE};
     esp_err_t btn=gpio_config(&button);
     if(btn!=ESP_OK)ESP_LOGW(TAG,"BOOT button unavailable: %s",esp_err_to_name(btn));
-    int prev=1,candidate=1;uint32_t edge=0,last_tp_retry=0,last_tp=0;char old_notice[96]={0};
+    mix_ui_volume(volume);
+    int prev=1,candidate=1;
+    uint32_t edge=0;char old_notice[96]={0};
+    last_tp_retry=clock_ms()-5001u;
+    mix_present_set_wait_hook(touch_wait_sample,NULL);
     bool unhealthy_started=false,draw_error_reported=false;uint32_t unhealthy_since=0;
     while(true){
         uint32_t ms=clock_ms(),stamp;
@@ -403,18 +539,30 @@ void app_main(void){
         /* Consume the durable OTA restart before input/audio/UI work. */
         if(mix_link_take_restart_request())mix_restart();
         if(mix_link_take_input_reset())mix_keyboard_reset_input();
+        /* Previously sampled gestures precede a newly observed lock key. */
+        dispatch_touch();
         mix_keyboard_tick(ms);view.keyboard_online=mix_keyboard_online();view.keyboard_overflows=mix_keyboard_overflows();
-        if(!tp&&(uint32_t)(ms-last_tp_retry)>5000){last_tp_retry=ms;gt911_init(&tp);}
-        if(tp){gt911_touch_t t={0};esp_err_t e=gt911_read(tp,&t);
-            if(e==ESP_OK){mix_ui_touch(t.x,t.y,t.count>0);last_tp=ms;}
-            else if(e!=ESP_ERR_NOT_FOUND||(uint32_t)(ms-last_tp)>500)mix_ui_touch(0,0,false);}
+        /* Drain previous display-wait input before recovery or fresh polling,
+         * then apply the newest sample before the next UI render. */
+        dispatch_touch();
+        if((!tp||tp_errors>=3)&&(uint32_t)(ms-last_tp_retry)>5000){
+            last_tp_retry=ms;touch_x=touch_y=0;tp_down=false;
+            touch_read_at=touch_count=0;mix_ui_touch_cancel();
+            esp_err_t retry=recover_touch();
+            if(retry==ESP_OK){tp_errors=0;ESP_LOGI(TAG,"GT911 touch recovered");}
+            else ESP_LOGW(TAG,"GT911 recovery failed: %s",esp_err_to_name(retry));
+        }
+        sample_touch(clock_ms(),true);
+        dispatch_touch();
         int level=gpio_get_level(PIN_BOOT_BTN);
         if(level!=candidate){candidate=level;edge=ms;}
-        if(level!=prev&&(uint32_t)(ms-edge)>=40){prev=level;if(!level&&!view.maintenance_busy){mix_ui_home_toggle();mix_keyboard_reset_input();}}
+        if(level!=prev&&(uint32_t)(ms-edge)>=40){prev=level;/* lock key intentionally unused */}
         actions();
         const char *msg=mix_link_notice();if(strcmp(msg,old_notice)){snprintf(old_notice,sizeof(old_notice),"%s",msg);mix_ui_notice(msg);}
         view.firmware_on_trial=mix_ota_pending_verify();
-        mix_ui_tick(&view,ms);
+        mix_ui_tick(&view,clock_ms());
+        /* Wake the backlight only after the lock surface has been presented. */
+        sync_local_lock();
         /* Only a completed render/loop counts as main-task progress. Driver
          * success, continuing scanout, USB init and actual IO/OTA worker loops
          * are distinct evidence; USB mount alone is not a protocol health test. */
@@ -451,7 +599,9 @@ void app_main(void){
             mix_keyboard_reset_input();mix_ui_notice("Entering ROM download mode");mix_ui_tick(&view,ms);
             vTaskDelay(pdMS_TO_TICKS(100));REG_WRITE(RTC_CNTL_OPTION1_REG,RTC_CNTL_FORCE_DOWNLOAD_BOOT);esp_restart();
         }
-        /* A firmware transfer drains the RX queue far faster at 5 ms. */
-        vTaskDelay(pdMS_TO_TICKS(view.ota_state==MIX_OTA_RECEIVING?5:20));
+        /* RGB presentation paces motion at frame boundaries; avoid adding a
+         * fixed 20 ms sleep to every animation frame. Input polling is bounded
+         * independently, and OTA retains its existing 5 ms cadence. */
+        vTaskDelay(pdMS_TO_TICKS(view.ota_state==MIX_OTA_RECEIVING?5:mix_ui_needs_fast_tick()?2:20));
     }
 }

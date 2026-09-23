@@ -25,6 +25,7 @@ DEST = ROOT / "build/esp32s3"
 # when a new candidate and its reports use isolated output directories.
 PRESERVED = DEST
 BUILD_DIR = None
+ISOLATED_CONFIG = False
 BUILD_COMMAND = 'py -3.12 tests/esp_font_build.py build'
 OLD_SHA = "9593904eab8c1bcaaef9c383abc9a5308ae4beeece94989436360289eafc675b"
 OLD_BYTES = 469104
@@ -94,11 +95,15 @@ def app_slot():
             "table": info(table)}
 
 
+def configured_sdkconfig():
+    return APP.parent / 'sdkconfig' if ISOLATED_CONFIG else ROOT / 'firmware/esp32s3/sdkconfig'
+
+
 def input_records():
     project = ROOT / 'firmware/esp32s3'
     sources = [info(path) for path in sorted((project / 'main').iterdir())
                if path.suffix in ('.c', '.h') or path.name in ('CMakeLists.txt', 'idf_component.yml')]
-    inputs = [info(project / name) for name in
+    inputs = [info(configured_sdkconfig() if name == 'sdkconfig' else project / name) for name in
               ('sdkconfig', 'sdkconfig.defaults', 'partitions.csv', 'CMakeLists.txt', 'dependencies.lock')]
     components = [dict(info(path), component_path=path.relative_to(project).as_posix())
                   for path in sorted((project / 'components').rglob('*'))
@@ -163,8 +168,7 @@ def report():
     copy.write_bytes(APP.read_bytes())
     sources = [info(path) for path in sorted((ROOT / 'firmware/esp32s3/main').iterdir())
                if path.suffix in ('.c', '.h') or path.name in ('CMakeLists.txt', 'idf_component.yml')]
-    build_inputs = [info(ROOT / 'firmware/esp32s3' / name)
-                    for name in ('sdkconfig', 'sdkconfig.defaults', 'partitions.csv', 'CMakeLists.txt', 'dependencies.lock')]
+    build_inputs = input_records()['build_inputs']
     build_config = json.loads((APP.parent / 'config/sdkconfig.json').read_text(encoding='utf-8'))
     effective_config = {'CONFIG_' + key: value for key, value in build_config.items()}
     rtc_layout = [line for line in symbols.splitlines()
@@ -192,7 +196,7 @@ def report():
               "sources": sources, "build_inputs": build_inputs,
               "component_sources": input_records()['component_sources'],
               "effective_config": effective_config, "rtc_diagnostic_symbols": rtc_layout,
-              "sdkconfig": info(ROOT / 'firmware/esp32s3/sdkconfig'),
+              "sdkconfig": info(configured_sdkconfig()),
               "sdkconfig_generated": info(APP.parent / 'config/sdkconfig.json'),
               "elf": info(APP.with_suffix('.elf')),
               "build_command": BUILD_COMMAND,
@@ -221,7 +225,11 @@ if __name__ == "__main__":
     parser.add_argument("stage", choices=("preserve", "build", "report"))
     parser.add_argument('--build-dir', type=Path, help='isolated candidate output; requires --report-dir')
     parser.add_argument('--report-dir', type=Path, help='isolated build reports; requires --build-dir')
+    parser.add_argument('--isolated-config', action='store_true',
+                        help='bind and compile the existing sdkconfig inside --build-dir')
     args = parser.parse_args()
+    if args.isolated_config and args.build_dir is None:
+        parser.error('--isolated-config requires --build-dir and --report-dir')
     if (args.build_dir is None) != (args.report_dir is None):
         parser.error('--build-dir and --report-dir must be specified together')
     if args.build_dir is not None:
@@ -231,6 +239,11 @@ if __name__ == "__main__":
             parser.error(str(exc))
         APP = BUILD_DIR / 'mixos_esp32s3.bin'
         BUILD_COMMAND += ' --build-dir ' + str(BUILD_DIR) + ' --report-dir ' + str(DEST)
+    if args.isolated_config:
+        ISOLATED_CONFIG = True
+        if not configured_sdkconfig().is_file():
+            parser.error('--isolated-config requires an existing complete sdkconfig')
+        BUILD_COMMAND += ' --isolated-config'
     if args.stage == "preserve":
         preserve()
         preserve_candidate()
@@ -240,7 +253,9 @@ if __name__ == "__main__":
         preserve()
         preserve_candidate()
         before = input_records()
-        result = subprocess.run(host_command(["bash", "-lc", idf_env.build_command(ROOT, BUILD_DIR)]),
+        command = idf_env.build_command(ROOT, BUILD_DIR,
+                                       configured_sdkconfig() if ISOLATED_CONFIG else None)
+        result = subprocess.run(host_command(["bash", "-lc", command]),
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         DEST.mkdir(parents=True, exist_ok=True)
         (DEST / "font-app-build.log").write_bytes(result.stdout)

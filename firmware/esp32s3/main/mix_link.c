@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <float.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -46,8 +47,12 @@ static uint16_t req_cols,req_rows;
 static uint32_t shot_session,shot_offset,shot_total;
 static uint8_t shot_frame[4+MIX_SCREEN_CHUNK];
 static uint8_t open_app;
+static uint32_t terminal_exit_serial;
+static uint8_t terminal_exit_app;
 static uint32_t net_session,net_deadline;
-static uint32_t time_base_s,time_base_ms;
+static uint32_t time_base_s,time_base_ms,wifi_rate_time;
+/* The clock pair outlives USB epochs; neither part is link-local telemetry. */
+static int16_t time_tz_offset_min;
 static mix_net_entry_t net_list[MIX_NET_MAX];
 static int net_count;
 static char net_message[96];
@@ -119,9 +124,9 @@ static void restart_link(void){
     rx_time=now;hello_time=now-1000;ping_time=status_time=now;
     metrics.linux_cpu=metrics.linux_temp=NAN;
     metrics.linux_mem_used_kib=metrics.linux_mem_total_kib=metrics.linux_uptime_s=0;
-    metrics.wifi_reported=metrics.wifi_connected=false;metrics.wifi_signal=-1;
+    metrics.wifi_reported=metrics.wifi_connected=metrics.wifi_speed_valid=false;
+    metrics.wifi_signal=-1;metrics.wifi_rx_bps=-1;
     metrics.wifi_ssid[0]=metrics.host_ip[0]=0;
-    metrics.host_time_s=0;metrics.host_tz_offset_min=0;
 }
 typedef struct {
     mix_decoder_t decoder;
@@ -218,7 +223,8 @@ static void terminal_reply(const uint8_t *bytes,size_t len,void *ctx){
 esp_err_t mix_link_init(void){
     rxq=xQueueCreate(16,sizeof(mix_frame_t));controlq=xQueueCreate(12,sizeof(mix_frame_t));inputq=xQueueCreate(16,sizeof(mix_frame_t));
     if(!rxq||!controlq||!inputq)return ESP_ERR_NO_MEM;
-    metrics.linux_cpu=metrics.linux_temp=NAN;metrics.wifi_signal=-1;
+    metrics.linux_cpu=metrics.linux_temp=NAN;metrics.wifi_signal=-1;metrics.wifi_rx_bps=-1;
+    metrics.wifi_speed_valid=false;
     mix_terminal_init();mix_terminal_set_reply(terminal_reply,NULL);return ESP_OK;
 }
 esp_err_t mix_link_start_io(void){return xTaskCreate(io_task,"mix_usb",8192,NULL,6,NULL)==pdPASS?ESP_OK:ESP_ERR_NO_MEM;}
@@ -253,6 +259,7 @@ static void copy_string(cJSON *j,const char *key,char *out,size_t cap){
 }
 static uint32_t whole(double v){return isfinite(v)&&v>=0&&v<UINT32_MAX?(uint32_t)v:0;}
 static void json_metrics(const mix_frame_t *f){
+    metrics.wifi_speed_valid=false;metrics.wifi_rx_bps=-1;
     cJSON *j=cJSON_ParseWithLength((const char*)f->payload,f->length);if(!j)return;
     metrics.linux_cpu=(float)number(j,"cpu_pct");metrics.linux_temp=(float)number(j,"temp_c");
     metrics.linux_mem_used_kib=whole(number(j,"mem_used_kib"));
@@ -267,16 +274,26 @@ static void json_metrics(const mix_frame_t *f){
         metrics.wifi_connected=cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(wifi,"connected"));
         double s=number(wifi,"signal");
         metrics.wifi_signal=(isfinite(s)&&s>=0&&s<=100)?(int)s:-1;
+        double rx=number(wifi,"rx_bps");
+        /* A rate is meaningful only for the connected state in this same
+         * status object. A disconnected report must not retain or display a
+         * counter from an earlier link. */
+        metrics.wifi_speed_valid=metrics.wifi_connected&&isfinite(rx)&&rx>=0&&rx<=FLT_MAX;
+        metrics.wifi_rx_bps=metrics.wifi_speed_valid?(float)rx:-1;
+        if(metrics.wifi_speed_valid)wifi_rate_time=now;
     }else{
-        metrics.wifi_connected=false;metrics.wifi_signal=-1;metrics.wifi_ssid[0]=0;
+        metrics.wifi_connected=false;metrics.wifi_speed_valid=false;metrics.wifi_signal=-1;
+        metrics.wifi_rx_bps=-1;metrics.wifi_ssid[0]=0;
     }
     copy_string(j,"ip",metrics.host_ip,sizeof(metrics.host_ip));
-    metrics.host_time_s=whole(number(j,"time_s"));
-    double tz=number(j,"tz_offset_min");
-    metrics.host_tz_offset_min=(isfinite(tz)&&tz>=-1440&&tz<=1440)?(int16_t)tz:0;
-    /* The host is polled every two seconds; the local monotonic clock carries
-     * the seconds in between so the status bar does not visibly stutter. */
-    if(metrics.host_time_s){time_base_s=metrics.host_time_s;time_base_ms=now;}
+    double wall=number(j,"time_s"),tz=number(j,"tz_offset_min");
+    /* Accept one complete clock pair, never reinterpret a held local clock as
+     * UTC because STATUS omitted/nullified its timezone. Zero means unknown;
+     * integers and current civil offsets (UTC-12..UTC+14) are the wire contract. */
+    if(isfinite(wall)&&wall>=1&&wall<=UINT32_MAX&&floor(wall)==wall&&
+       isfinite(tz)&&tz>=-720&&tz<=840&&floor(tz)==tz){
+        time_base_s=(uint32_t)wall;time_base_ms=now;time_tz_offset_min=(int16_t)tz;
+    }
     cJSON_Delete(j);
 }
 static void credit(void){uint8_t b[4];mix_put32(b,granted);enqueue(MIX_CH_TERMINAL,MIX_CREDIT,session,b,4);}
@@ -390,6 +407,11 @@ static void maintenance(const mix_frame_t *f){
         return;
     /* Answerable whenever the UI exists, including with no update in progress:
      * its whole purpose is to let the host see what is actually on the panel. */
+    case MIX_UI_PERF_REQUEST:{
+        if(f->length)return;
+        char p[MIX_MAX_PAYLOAD];size_t n=mix_ui_performance(p,sizeof(p));
+        if(n)enqueue(MIX_CH_MAINTENANCE,MIX_UI_PERF_RESPONSE,f->session,p,n);
+        return;}
     case MIX_SCREEN_REQUEST:{
         if(f->length)return;
         if(ota_session||mix_ota_transaction_busy()){maintenance_error(f->session,"capture deferred during firmware update");return;}
@@ -450,7 +472,12 @@ static void handle(const mix_frame_t *f){
             uint32_t avail=granted-received;
             if(avail>MIX_RX_WINDOW||f->length>avail){mix_link_close_terminal();set_notice("Terminal flow control violation");return;}
             received+=f->length;mix_terminal_feed(f->payload,f->length);granted+=f->length;credit_dirty=true;
-        }else if(f->type==MIX_EXIT){clear_session();set_notice("Terminal session ended");}
+        }else if(f->type==MIX_EXIT&&f->length==4){
+            if(terminal_open&&mix_get32(f->payload)==0){
+                terminal_exit_app=open_app;++terminal_exit_serial;
+            }
+            clear_session();set_notice("Terminal session ended");
+        }
         else if(f->type==MIX_ERROR){clear_session();set_notice("Linux rejected terminal request");}
     }
     if(f->channel==MIX_CH_STATUS&&f->session==0&&f->type==MIX_STATUS)json_metrics(f);
@@ -493,6 +520,7 @@ void mix_link_tick(uint32_t now_ms,mix_view_t *v){
     if(ota_session&&!mix_ota_transaction_busy()&&mix_ota_state()==MIX_OTA_FAILED){clear_ota();}
     if(mix_ota_take_worker_restart()){restart_at=0;restart_request=true;}
     v->linux_online=online;v->terminal_open=terminal_open;
+    v->terminal_exit_serial=terminal_exit_serial;v->terminal_exit_app=terminal_exit_app;
     v->maintenance_busy=pending_update||ota_session||restart_at||mix_ota_transaction_busy();
     v->ota_state=(uint8_t)mix_ota_state();v->ota_percent=mix_ota_percent();
     v->job_running=job_running;v->job_percent=job_percent;
@@ -503,12 +531,23 @@ void mix_link_tick(uint32_t now_ms,mix_view_t *v){
     v->wifi_reported=online&&metrics.wifi_reported;
     v->wifi_connected=v->wifi_reported&&metrics.wifi_connected;
     v->wifi_signal=v->wifi_reported?metrics.wifi_signal:-1;
+    if(!online||(uint32_t)(now-wifi_rate_time)>=6000u)metrics.wifi_speed_valid=false;
+    v->wifi_speed_valid=v->wifi_reported&&metrics.wifi_connected&&metrics.wifi_speed_valid;
+    v->wifi_rx_bps=v->wifi_speed_valid?metrics.wifi_rx_bps:-1;
     snprintf(v->wifi_ssid,sizeof(v->wifi_ssid),"%s",v->wifi_reported?metrics.wifi_ssid:"");
     snprintf(v->host_ip,sizeof(v->host_ip),"%s",online?metrics.host_ip:"");
-    /* Time keeps running on the local monotonic clock once the host has said
-     * what time it is, so a dropped link blanks the network, not the clock. */
-    v->host_time_s=time_base_s?time_base_s+(now-time_base_ms)/1000u:0;
-    v->host_tz_offset_min=metrics.host_tz_offset_min;
+    /* Roll the baseline forward on every tick, retaining subsecond remainder.
+     * A fixed last-STATUS baseline would rewind after 49.7 days without a new
+     * sample when the uint32 millisecond counter wraps. Tick gaps must remain
+     * below one complete counter period, as elsewhere in the link timers. */
+    if(time_base_s){
+        uint32_t elapsed=(uint32_t)(now-time_base_ms)/1000u;
+        if(elapsed>UINT32_MAX-time_base_s)time_base_s=0;
+        else time_base_s+=elapsed;
+        time_base_ms+=elapsed*1000u;
+    }
+    v->host_time_s=time_base_s;
+    v->host_tz_offset_min=time_tz_offset_min;
 }
 bool mix_link_open_app(mix_app_t app){
     if(!online||pending_update||ota_session)return false;

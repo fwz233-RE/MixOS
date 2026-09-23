@@ -152,6 +152,63 @@ class ReleaseProvenanceTests(unittest.TestCase):
         self.put(reports / 'font-app-build.json', self.report_path.read_bytes())
         return artifacts, reports
 
+    def isolated_configuration_fixture(self):
+        artifacts, reports = self.isolated_fixture()
+        config = artifacts / 'sdkconfig'
+        self.put(config, 'CONFIG_LV_DEF_REFR_PERIOD=33\n')
+        report = copy.deepcopy(self.report)
+        receipt = copy.deepcopy(self.receipt)
+        report['sdkconfig'] = build.info(config)
+        report['build_inputs'][0] = build.info(config)
+        receipt['inputs']['build_inputs'] = report['build_inputs']
+        self.put(reports / 'completed-build.json', json.dumps(receipt))
+        report['build_attestation'] = build.info(reports / 'completed-build.json')
+        self.put(reports / 'font-app-build.json', json.dumps(report))
+        return artifacts, reports, config
+
+    def test_isolated_configuration_binds_actual_input_not_stable_default(self):
+        artifacts, reports, config = self.isolated_configuration_fixture()
+        value = release.generate(self.root, build_dir=artifacts, report_dir=reports,
+                                 isolated_config=True)
+        self.assertEqual(value['provenance']['sdkconfig_sha256'], release.digest(config))
+        self.assertEqual((self.project / 'sdkconfig').read_text(), 'sdkconfig')
+        with self.assertRaisesRegex(ValueError, 'changed'):
+            release.generate(self.root, build_dir=artifacts, report_dir=reports)
+        self.put(config, 'edited since compile')
+        with self.assertRaisesRegex(ValueError, 'changed'):
+            release.generate(self.root, build_dir=artifacts, report_dir=reports,
+                             isolated_config=True)
+
+    def test_isolated_configuration_requires_isolated_directories(self):
+        with self.assertRaisesRegex(ValueError, 'requires'):
+            release.generate(self.root, isolated_config=True)
+
+    def test_build_command_pins_complete_custom_configuration(self):
+        import idf_env
+        artifacts = self.root / 'path with space/build'
+        config = artifacts / 'sdkconfig'
+        command = idf_env.build_command(self.root, artifacts, config)
+        self.assertIn('SDKCONFIG=' + idf_env.to_posix(config), command)
+        self.assertIn('SDKCONFIG_DEFAULTS=' + idf_env.to_posix(self.project / 'sdkconfig.defaults'), command)
+        with self.assertRaisesRegex(ValueError, 'requires'):
+            idf_env.build_command(self.root, sdkconfig=config)
+
+    def test_driver_binds_and_rejects_changed_isolated_configuration(self):
+        artifacts, reports, config = self.isolated_configuration_fixture()
+        with mock.patch.object(build, 'ROOT', self.root), \
+                mock.patch.object(build, 'APP', artifacts / self.app.name), \
+                mock.patch.object(build, 'DEST', reports), \
+                mock.patch.object(build, 'ISOLATED_CONFIG', True):
+            before = build.input_records()
+            self.assertEqual(before['build_inputs'][0], build.info(config))
+            build.attest_build(before)
+            build.checked_attestation()
+            self.put(config, 'edited during compile')
+            with self.assertRaisesRegex(RuntimeError, 'changed during compilation'):
+                build.attest_build(before)
+            with self.assertRaisesRegex(RuntimeError, 'changed'):
+                build.checked_attestation()
+
     def test_isolated_build_keeps_original_artifacts_and_reports_unchanged(self):
         artifacts, reports = self.isolated_fixture()
         original = self.app.read_bytes(), self.report_path.read_bytes(), self.receipt_path.read_bytes()

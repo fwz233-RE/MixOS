@@ -42,6 +42,7 @@ esp_err_t mix_watchdog_task_reset(mix_health_task_t role){assert(role==MIX_HEALT
 static void mix_ota_local_health_tick(uint32_t ms,bool healthy){assert(ms==now&&!healthy);local_ticks++;}
 bool mix_health_handoff(uint32_t ms){assert(ms==now);handoffs++;return true;}
 bool mix_health_degraded_handoff(uint32_t ms){assert(ms==now);degraded++;return true;}
+static bool mix_present_frame_complete(void){return false;}
 #include "main_health_functions.h"
 
 static void reset_case(void){

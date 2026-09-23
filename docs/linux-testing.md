@@ -28,6 +28,16 @@ tic -c linux/mixos.terminfo
 
 更新侧用例包括 `test_mixos_esp_update.py`、`test_ota_v2.py`、`test_ota_supervisor.py`、`test_ota_diagnostics.py` 与 `test_ota_remeasurement.py`。
 
+## 时间回归
+
+```sh
+python3 -B -m unittest discover -s tests -p test_time_sync.py -v
+```
+
+该文件覆盖主机单次 UTC 采样、运行中时区刷新、UTC／Asia/Shanghai／半小时及四十五分钟偏移、夏令时边界，以及 Python 协议帧经生产 C 解码器、真实 cJSON 和 `mix_link.c` 后的时间状态。故障注入包括 STATUS 丢失／字段缺失或非法、USB 断连重连、连接 epoch 更新、队列故障、心跳超时、旧序列与损坏帧、主机前后校时、32 位毫秒回绕、模拟离线 50 天和 Unix 秒溢出。
+
+真实时区规则用例要求 POSIX `tzset`；Windows Python 会跳过这两项，应在 WSL 内运行 Python 补齐。C 链路测试使用现有 vendored cJSON、POSIX 编译器及 AddressSanitizer／UndefinedBehaviorSanitizer；缺失依赖会明确跳过。测试不修改实际系统时区、不连接 Pi，也不刷写硬件。现场时区设置与断线保时限制见 [Linux 主机服务](linux.md)。
+
 ## 限制
 
 伪终端不能证明真实 USB 端点、重枚举、udev 权限或芯片复位行为。模拟服务也不代表生产 systemd 权限已经配置。

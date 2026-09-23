@@ -303,7 +303,7 @@ class LinkTests(unittest.TestCase):
     def test_clock_is_always_reported(self):
         sample = HostMetrics().sample()
         self.assertIsInstance(sample['time_s'], int)
-        self.assertTrue(-1440 <= sample['tz_offset_min'] <= 1440)
+        self.assertTrue(-720 <= sample['tz_offset_min'] <= 840)
 
 
 class ApplicationTests(unittest.TestCase):
@@ -480,6 +480,12 @@ class NetworkChannelTests(unittest.TestCase):
         self.assertIn(b'lab', listing[0].payload)
         self.assertIn(b'guest', listing[0].payload)
 
+    def test_scan_helper_budget_is_below_device_deadline(self):
+        self.send(C.NET, T.NET_SCAN, 5)
+        timeout = self.net.started[0][3]
+        self.assertGreater(timeout, netctl.TIMEOUT_SCAN_REQUEST)
+        self.assertLess(timeout + 2, 20)  # Includes NetWorker's kill/wait grace.
+
     def test_connect_passes_the_passphrase_only_through_the_helper_request(self):
         self.send(C.NET, T.NET_CONNECT, 6, self.pack('lab', 'hunter2'))
         kind, session, request, _timeout = self.net.started[0]
@@ -546,33 +552,264 @@ class NetctlTests(unittest.TestCase):
         entries = list(netctl._split(r'80:WPA2:*:my\:network'))
         self.assertEqual(entries, ['80', 'WPA2', '*', 'my:network'])
 
-    def test_scan_merges_duplicates_and_sorts_by_signal(self):
-        listing = '\n'.join([
-            '40:WPA2: :lab',
-            '80:WPA2:*:lab',      # same network, stronger radio
-            '55::  :open',
-        ])
-        # A saved connection reports nmcli's connection type, not the device type.
-        profiles = '802-11-wireless:lab\n802-3-ethernet:wired'
-        with patch.object(netctl, '_run', side_effect=[listing, profiles]):
-            found = netctl.scan(rescan=False)
-        self.assertEqual([e['ssid'] for e in found], ['lab', 'open'])
-        self.assertEqual(found[0]['signal'], 80)
-        self.assertTrue(found[0]['secured'])
-        self.assertTrue(found[0]['known'])
-        self.assertFalse(found[1]['secured'])
-        self.assertFalse(found[1]['known'])
+    UUID_LAB = '11111111-1111-1111-1111-111111111111'
+    UUID_BACKUP = '22222222-2222-2222-2222-222222222222'
+    IDLE = 'wifi:disconnected:wlan0\nethernet:connected:eth0'
+
+    @classmethod
+    def profile_output(cls, *profiles):
+        """Actual nmcli multiline settings, not user-assigned profile NAMEs."""
+        if not profiles:
+            profiles = ((cls.UUID_LAB, 'lab'),)
+        listing, details = [], []
+        for uuid, ssid in profiles:
+            listing.append('802-11-wireless:' + uuid)
+            details.append('connection.uuid:%s\n802-11-wireless.ssid:%s\n'
+                           '802-11-wireless.mode:infrastructure\n'
+                           '802-11-wireless-security.key-mgmt:wpa-psk' % (uuid, ssid))
+        listing.append('802-3-ethernet:33333333-3333-3333-3333-333333333333')
+        return '\n'.join(listing), '\n\n'.join(details)
+
+    def test_scan_merges_duplicates_and_keeps_weaker_active_bssid(self):
+        for rows in (['40:WPA2:*:lab', '80:WPA2: :lab'],
+                     ['80:WPA2: :lab', '40:WPA2:*:lab']):
+            with self.subTest(rows=rows):
+                listing = '\n'.join(rows + ['55:: :open'])
+                with patch.object(netctl, '_run', side_effect=[listing, *self.profile_output()]) as run:
+                    found = netctl.scan(rescan=False)
+                self.assertEqual([e['ssid'] for e in found], ['lab', 'open'])
+                self.assertEqual(found[0]['signal'], 80)
+                self.assertTrue(found[0]['secured'])
+                self.assertTrue(found[0]['known'])
+                self.assertTrue(found[0]['active'])
+                self.assertFalse(found[1]['secured'])
+                self.assertFalse(found[1]['known'])
+                self.assertEqual(run.call_args_list[0].args[0][-2:], ['--rescan', 'no'])
+
+    def test_profiles_match_real_ssid_and_preserve_colons_and_backslashes(self):
+        ssid = r' actual:lab\west '
+        outputs = self.profile_output((self.UUID_LAB, ssid), (self.UUID_BACKUP, ssid))
+        # A connection can be renamed without changing its SSID or UUID. No
+        # command may request NAME or activate by a guessed profile label.
+        with patch.object(netctl, '_run', side_effect=outputs) as run:
+            profiles = netctl.saved_profiles()
+        self.assertEqual(list(profiles), [ssid])
+        self.assertEqual([p['uuid'] for p in profiles[ssid]], [self.UUID_LAB, self.UUID_BACKUP])
+        self.assertEqual(run.call_args_list[0].args[0],
+                         ['--terse', '--fields', 'TYPE,UUID', 'connection', 'show'])
+        self.assertEqual(run.call_args_list[1].args[0][-4:],
+                         ['uuid', self.UUID_LAB, 'uuid', self.UUID_BACKUP])
+        for call in run.call_args_list:
+            self.assertNotIn('--show-secrets', call.args[0])
+            self.assertNotIn('NAME', ','.join(call.args[0]))
+
+    def test_scan_escaped_ssid_matches_multiline_profile(self):
+        ssid = r'my:lab\west'
+        with patch.object(netctl, '_run', side_effect=[
+                r'80:WPA2: :my\:lab\\west', *self.profile_output((self.UUID_LAB, ssid)),
+                self.IDLE, '']) as run:
+            answer = netctl.handle({'verb': 'scan'})
+        self.assertEqual(answer['networks'][0]['ssid'], ssid)
+        self.assertTrue(answer['networks'][0]['known'])
+        self.assertEqual(run.call_args.args[0], ['--wait', '0', 'connection', 'up', 'uuid', self.UUID_LAB])
 
     def test_hidden_networks_are_dropped_rather_than_shown_blank(self):
-        with patch.object(netctl, '_run', side_effect=['70:WPA2: :', '802-11-wireless:other']):
+        with patch.object(netctl, '_run', side_effect=['70:WPA2: :', *self.profile_output()]):
             self.assertEqual(netctl.scan(rescan=False), [])
 
-    def test_connect_builds_an_argument_vector_with_no_shell(self):
+    def test_scan_requests_strongest_saved_secured_network_without_claiming_connected(self):
+        listing = '95:: :open\n40:WPA2: :weak\n80:WPA2: :lab\n99:WPA2: :unknown'
+        profiles = self.profile_output((self.UUID_LAB, 'lab'), (self.UUID_BACKUP, 'weak'))
+        with patch.object(netctl, '_run', side_effect=[listing, *profiles, self.IDLE, '']) as run:
+            answer = netctl.handle({'verb': 'scan'})
+        self.assertTrue(answer['ok'])
+        self.assertFalse(any(e['active'] for e in answer['networks']))
+        self.assertEqual(run.call_args.args[0], ['--wait', '0', 'connection', 'up', 'uuid', self.UUID_LAB])
+        self.assertEqual(run.call_count, 5)
+
+    def test_scan_does_not_displace_active_hidden_weak_or_duplicate_network(self):
+        strongest = '\n'.join('90:WPA2: :ap%d' % i for i in range(netctl.SCAN_MAX))
+        for listing in ('80:WPA2: :lab\n20:WPA2:*:current',
+                        '80:WPA2: :lab\n20:WPA2:*:',
+                        strongest + '\n10:WPA2:*:current\n5:WPA2: :lab',
+                        '10:WPA2:*:lab\n80:WPA2: :lab'):
+            with self.subTest(listing=listing):
+                with patch.object(netctl, '_run', side_effect=[listing, *self.profile_output()]) as run:
+                    answer = netctl.handle({'verb': 'scan'})
+                self.assertTrue(answer['ok'])
+                self.assertEqual(run.call_count, 3)  # No activation/state query.
+                self.assertLessEqual(len(answer['networks']), netctl.SCAN_MAX)
+
+    def test_auto_connect_can_find_saved_network_beyond_display_limit(self):
+        listing = '\n'.join('90:WPA2: :ap%d' % i for i in range(netctl.SCAN_MAX)) + '\n5:WPA2: :lab'
+        with patch.object(netctl, '_run', side_effect=[listing, *self.profile_output(), self.IDLE, '']) as run:
+            answer = netctl.handle({'verb': 'scan'})
+        self.assertEqual(len(answer['networks']), netctl.SCAN_MAX)
+        self.assertNotIn('lab', [e['ssid'] for e in answer['networks']])
+        self.assertEqual(run.call_args.args[0][-2:], ['uuid', self.UUID_LAB])
+
+    def test_scan_device_state_guard_fails_closed(self):
+        states = ('wifi:connected:wlan0', 'wifi:connecting (prepare):wlan0',
+                  'wifi:connecting (getting IP configuration):wlan0',
+                  'wifi:disconnected:wlan0\nwifi:connected:wlan1',
+                  'wifi:unavailable:wlan0', 'wifi:unmanaged:wlan0',
+                  'wifi:unknown:wlan0', 'broken', '', netctl.NetError('no permission'))
+        for state in states:
+            with self.subTest(state=state):
+                with patch.object(netctl, '_run', side_effect=[
+                        '80:WPA2: :lab', *self.profile_output(), state]) as run:
+                    answer = netctl.handle({'verb': 'scan'})
+                self.assertTrue(answer['ok'])
+                self.assertEqual(run.call_count, 4)
+
+    def test_scan_skips_open_aps_open_profiles_and_hotspot_profiles(self):
+        profiles, details = self.profile_output()
+        cases = [('80:: :lab', details),
+                 ('80:--: :lab', details),
+                 ('80:WPA2: :lab', details.replace('key-mgmt:wpa-psk', 'key-mgmt:')),
+                 ('80:WPA2: :lab', details.replace('mode:infrastructure', 'mode:ap'))]
+        for listing, config in cases:
+            with self.subTest(listing=listing, config=config):
+                with patch.object(netctl, '_run', side_effect=[listing, profiles, config]) as run:
+                    self.assertTrue(netctl.handle({'verb': 'scan'})['ok'])
+                self.assertEqual(run.call_count, 3)
+
+    def test_scan_does_not_activate_passwordless_owe_profile(self):
+        profiles, details = self.profile_output()
+        details = details.replace('key-mgmt:wpa-psk', 'key-mgmt:owe')
+        # SECURITY is nonempty, so filtering APs only by 'secured' is insufficient.
+        with patch.object(netctl, '_run', side_effect=['95:OWE: :lab', profiles, details]) as run:
+            answer = netctl.handle({'verb': 'scan'})
+        self.assertTrue(answer['ok'])
+        self.assertTrue(answer['networks'][0]['known'])
+        self.assertTrue(answer['networks'][0]['secured'])
+        self.assertFalse(answer['networks'][0]['active'])
+        self.assertEqual(run.call_count, 3)
+
+    def test_scan_skips_stronger_owe_and_activates_saved_password_profile(self):
+        profiles, details = self.profile_output((self.UUID_LAB, 'open-enhanced'),
+                                                (self.UUID_BACKUP, 'backup'))
+        details = details.replace('key-mgmt:wpa-psk', 'key-mgmt:owe', 1)
+        with patch.object(netctl, '_run', side_effect=[
+                '95:OWE: :open-enhanced\n60:WPA2: :backup', profiles, details,
+                self.IDLE, '']) as run:
+            answer = netctl.handle({'verb': 'scan'})
+        self.assertTrue(answer['ok'])
+        self.assertEqual(run.call_count, 5)
+        self.assertEqual(run.call_args.args[0],
+                         ['--wait', '0', 'connection', 'up', 'uuid', self.UUID_BACKUP])
+
+    def test_scan_retries_immediate_rejections_by_uuid_with_fresh_guard(self):
+        for backup_ssid in ('lab', 'backup'):
+            with self.subTest(backup_ssid=backup_ssid):
+                outputs = self.profile_output((self.UUID_LAB, 'lab'), (self.UUID_BACKUP, backup_ssid))
+                with patch.object(netctl, '_run', side_effect=[
+                        '90:WPA2: :lab\n60:WPA2: :backup', *outputs,
+                        self.IDLE, netctl.NetError('activation refused'), self.IDLE, '']) as run:
+                    answer = netctl.handle({'verb': 'scan'})
+                self.assertTrue(answer['ok'])
+                ups = [call.args[0] for call in run.call_args_list if 'up' in call.args[0]]
+                self.assertEqual([args[-1] for args in ups], [self.UUID_LAB, self.UUID_BACKUP])
+                self.assertEqual(run.call_count, 7)
+
+    def test_scan_stops_retry_if_another_connection_started(self):
+        outputs = self.profile_output((self.UUID_LAB, 'lab'), (self.UUID_BACKUP, 'backup'))
+        with patch.object(netctl, '_run', side_effect=[
+                '90:WPA2: :lab\n60:WPA2: :backup', *outputs,
+                self.IDLE, netctl.NetError('activation refused'), 'wifi:connecting:wlan0']) as run:
+            self.assertTrue(netctl.handle({'verb': 'scan'})['ok'])
+        self.assertEqual(sum('up' in call.args[0] for call in run.call_args_list), 1)
+
+    def test_scan_does_not_retry_an_activation_with_unknown_outcome(self):
+        outputs = self.profile_output((self.UUID_LAB, 'lab'), (self.UUID_BACKUP, 'backup'))
+        with patch.object(netctl, '_run', side_effect=[
+                '90:WPA2: :lab\n60:WPA2: :backup', *outputs,
+                self.IDLE, netctl.NetTimeout('activation outcome unknown')]) as run:
+            self.assertTrue(netctl.handle({'verb': 'scan'})['ok'])
+        self.assertEqual(run.call_count, 5)
+
+    def test_profile_query_failure_still_returns_scan(self):
+        with patch.object(netctl, '_run', side_effect=['80:WPA2: :lab', netctl.NetError('unavailable')]) as run:
+            answer = netctl.handle({'verb': 'scan'})
+        self.assertTrue(answer['ok'])
+        self.assertFalse(answer['networks'][0]['known'])
+        self.assertEqual(run.call_count, 2)
+
+    def test_scan_and_retries_share_one_monotonic_budget(self):
+        now = [0.0]
+        outputs = self.profile_output(*[('profile-%d' % i, 'lab') for i in range(100)])
+        responses = iter(['80:WPA2: :lab', *outputs])
+        calls = []
+
+        def slow_run(args, timeout):
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(now[0] + timeout, netctl.TIMEOUT_SCAN_REQUEST)
+            calls.append((args, timeout))
+            if len(calls) <= 3:
+                now[0] += min(1, timeout)
+                return next(responses)
+            now[0] += min(2, timeout)
+            if 'up' in args:
+                raise netctl.NetError('immediate rejection')
+            return self.IDLE
+
+        with patch.object(netctl.time, 'monotonic', side_effect=lambda: now[0]), \
+                patch.object(netctl, '_run', side_effect=slow_run):
+            answer = netctl.handle({'verb': 'scan'})
+        self.assertTrue(answer['ok'])
+        self.assertEqual(now[0], netctl.TIMEOUT_SCAN_REQUEST)
+        self.assertLess(len(calls), 12)
+        self.assertLess(netctl.TIMEOUT_SCAN_REQUEST, 20)
+
+    def test_slow_profile_queries_exhaust_budget_without_losing_scan(self):
+        now = [0.0]
+        responses = iter(['80:WPA2: :lab', *self.profile_output()])
+        timeouts = []
+
+        def slow_run(args, timeout):
+            timeouts.append(timeout)
+            now[0] += timeout
+            return next(responses)
+
+        with patch.object(netctl.time, 'monotonic', side_effect=lambda: now[0]), \
+                patch.object(netctl, '_run', side_effect=slow_run):
+            answer = netctl.handle({'verb': 'scan'})
+        self.assertTrue(answer['ok'])
+        self.assertEqual(timeouts, [8, 6, 2])
+        self.assertEqual(now[0], netctl.TIMEOUT_SCAN_REQUEST)
+
+    def test_saved_activation_uses_uuid_without_reading_or_passing_password(self):
+        with patch.object(netctl, '_run', return_value='') as run:
+            netctl.activate_saved(self.UUID_LAB)
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], ['--wait', '0', 'connection', 'up', 'uuid', self.UUID_LAB])
+        self.assertLessEqual(run.call_args.args[1], netctl.TIMEOUT_ACTIVATE)
+
+    def test_nmcli_timeout_remains_distinct_with_no_interactive_input(self):
+        with patch.object(netctl, '_binary', return_value='/usr/bin/nmcli'), \
+                patch.object(netctl.subprocess, 'run',
+                             side_effect=netctl.subprocess.TimeoutExpired('nmcli', 2)) as run:
+            with self.assertRaises(netctl.NetTimeout):
+                netctl.activate_saved(self.UUID_LAB)
+        self.assertEqual(run.call_args.args[0],
+                         ['/usr/bin/nmcli', '--wait', '0', 'connection', 'up', 'uuid', self.UUID_LAB])
+        self.assertEqual(run.call_args.kwargs['stdin'], netctl.subprocess.DEVNULL)
+        self.assertEqual(run.call_args.kwargs['env']['LC_ALL'], 'C')
+        self.assertLessEqual(run.call_args.kwargs['timeout'], netctl.TIMEOUT_ACTIVATE)
+        self.assertNotIn('shell', run.call_args.kwargs)
+
+    def test_forget_uses_matching_real_ssid_uuids_not_connection_names(self):
+        outputs = self.profile_output((self.UUID_LAB, 'lab'), (self.UUID_BACKUP, 'lab'))
+        with patch.object(netctl, '_run', side_effect=[*outputs, '']) as run:
+            self.assertEqual(netctl.forget('lab'), 'forgot lab')
+        self.assertEqual(run.call_args.args[0],
+                         ['connection', 'delete', 'uuid', self.UUID_LAB, 'uuid', self.UUID_BACKUP])
+
+    def test_connect_uses_an_argument_vector(self):
         calls = []
 
         def fake_run(args, timeout):
             calls.append(args)
-            # The device query is the only call that returns anything useful here.
             return 'wifi:wlan0' if args[-1] == 'device' else ''
 
         with patch.object(netctl, '_run', side_effect=fake_run):
@@ -623,10 +860,11 @@ class NetctlTests(unittest.TestCase):
     def test_state_distinguishes_unknown_from_disconnected(self):
         with patch.object(netctl, '_run', side_effect=netctl.NetError('no nmcli')):
             self.assertIsNone(netctl.state())
-        with patch.object(netctl, '_run', return_value=' :40:other\n*:65:lab\n'):
+        with patch.object(netctl, '_run', return_value=' :wlan0:40:other\n*:wlan0:65:lab\n'):
             self.assertEqual(netctl.state(),
-                             {'connected': True, 'ssid': 'lab', 'signal': 65})
-        with patch.object(netctl, '_run', return_value=' :40:other\n'):
+                             {'connected': True, 'ssid': 'lab', 'signal': 65,
+                              'interface': 'wlan0'})
+        with patch.object(netctl, '_run', return_value=' :wlan0:40:other\n'):
             self.assertEqual(netctl.state(),
                              {'connected': False, 'ssid': '', 'signal': None})
 

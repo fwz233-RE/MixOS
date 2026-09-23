@@ -352,7 +352,7 @@ KEY_SEQUENCES = {
     '[A': 'up', '[B': 'down', '[C': 'right', '[D': 'left',
     '[H': 'home', '[F': 'end', '[1~': 'home', '[4~': 'end',
     '[5~': 'pageup', '[6~': 'pagedown', '[2~': 'insert', '[3~': 'delete',
-    '[Z': 'shift-tab',
+    '[Z': 'shift-tab', '[32;2u': 'shift-space',
     'OA': 'up', 'OB': 'down', 'OC': 'right', 'OD': 'left',
 }
 
@@ -461,33 +461,42 @@ class Keyboard:
         except UnicodeDecodeError:
             return None
 
+    def _read_more(self, timeout: float) -> bool:
+        # wait() intentionally reports buffered bytes as ready. When decoding
+        # an incomplete escape, poll the fd itself or os.read could block.
+        try:
+            ready, _, _ = select.select([self.fd], [], [], timeout)
+            if not ready:
+                return False
+            chunk = os.read(self.fd, 1024)
+        except (OSError, ValueError):
+            return False
+        self.buffer += chunk
+        return bool(chunk)
+
     def _escape(self) -> str | None:
-        # A bare Escape and the start of an arrow key look identical until the
-        # next byte arrives or does not.
-        if len(self.buffer) == 1:
-            if not self.wait(0.05):
-                self.buffer = self.buffer[1:]
-                return 'escape'
-            try:
-                self.buffer += os.read(self.fd, 1024)
-            except (OSError, ValueError):
-                self.buffer = b''
-                return 'escape'
-        body = self.buffer[1:]
-        if not body:
-            self.buffer = self.buffer[1:]
+        # A lone Escape needs a short timeout, but once a CSI/SS3 introducer
+        # arrived retain its parameters across reads. Splitting Shift+Space's
+        # CSI 32;2u must not leak "32;2u" into a note without term-ime.
+        if len(self.buffer) == 1 and not self._read_more(0.05):
+            self.buffer = b''
             return 'escape'
-        text = body.decode('latin-1')
-        for length in range(1, min(len(text), 6) + 1):
-            candidate = text[:length]
-            if candidate in KEY_SEQUENCES:
-                self.buffer = self.buffer[1 + length:]
-                return KEY_SEQUENCES[candidate]
-            if candidate in ('OP', 'OQ', 'OR', 'OS'):
-                self.buffer = self.buffer[1 + length:]
-                return 'f' + str(ord(candidate[1]) - ord('P') + 1)
-        # Unrecognised: drop the introducer and whatever terminates the sequence
-        # so a stray report cannot be mistaken for typed text.
-        match = re.match(r'[\[\]O][0-9;?]*[A-Za-z~]', text)
-        self.buffer = self.buffer[1 + (match.end() if match else 1):]
-        return None
+        while True:
+            text = self.buffer[1:].decode('latin-1')
+            for sequence, name in KEY_SEQUENCES.items():
+                if text.startswith(sequence):
+                    self.buffer = self.buffer[1 + len(sequence):]
+                    return name
+            if len(text) >= 2 and text[:2] in ('OP', 'OQ', 'OR', 'OS'):
+                self.buffer = self.buffer[3:]
+                return 'f' + str(ord(text[1]) - ord('P') + 1)
+            if len(text) <= 32 and re.fullmatch(r'[\[O][0-9;?]*', text):
+                if self._read_more(0.05):
+                    continue
+                return None
+            # Unrecognised: discard the whole sequence, never printable tail
+            # bytes. Bound partial input so a malformed report cannot grow it.
+            match = re.match(r'[\[\]O][0-9;?]*[A-Za-z~]', text)
+            consumed = match.end() if match else (len(text) if len(text) > 32 else 1)
+            self.buffer = self.buffer[1 + consumed:]
+            return None

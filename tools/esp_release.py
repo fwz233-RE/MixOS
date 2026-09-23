@@ -38,12 +38,16 @@ def checked(record, path):
     if digest(path) != record.get('sha256'):
         raise ValueError('build input/artifact changed: ' + str(path))
 
-def generate(root=ROOT, replacement_package=None, *, build_dir=None, report_dir=None):
+def generate(root=ROOT, replacement_package=None, *, build_dir=None, report_dir=None,
+             isolated_config=False):
     root = Path(root)
     project = root / 'firmware/esp32s3'
     if (build_dir is None) != (report_dir is None):
         raise ValueError('isolated build and report directories must be supplied together')
+    if isolated_config and build_dir is None:
+        raise ValueError('isolated configuration requires build and report directories')
     artifacts = Path(build_dir) if build_dir is not None else project / 'build'
+    config_path = artifacts / 'sdkconfig' if isolated_config else project / 'sdkconfig'
     reports = Path(report_dir) if report_dir is not None else root / 'build/esp32s3'
     report_file = reports / 'font-app-build.json'
     report = json.loads(report_file.read_text(encoding='utf-8'))
@@ -53,7 +57,7 @@ def generate(root=ROOT, replacement_package=None, *, build_dir=None, report_dir=
     image_path = artifacts / 'mixos_esp32s3.bin'
     checked(report['build_app'], image_path)
     checked(report['elf'], image_path.with_suffix('.elf'))
-    checked(report['sdkconfig'], project / 'sdkconfig')
+    checked(report['sdkconfig'], config_path)
     checked(report['sdkconfig_generated'], artifacts / 'config/sdkconfig.json')
     table = artifacts / 'partition_table/partition-table.bin'
     checked(report['partition_table'], table)
@@ -89,7 +93,7 @@ def generate(root=ROOT, replacement_package=None, *, build_dir=None, report_dir=
     if len(names) != len(set(names)) or set(names) != required_inputs:
         raise ValueError('configuration/build dependency coverage incomplete')
     for name, record in zip(names, inputs):
-        checked(record, project / name)
+        checked(record, config_path if name == 'sdkconfig' else project / name)
     receipt_path = reports / 'completed-build.json'
     checked(report.get('build_attestation', {}), receipt_path)
     receipt = json.loads(receipt_path.read_text(encoding='utf-8'))
@@ -120,7 +124,7 @@ def generate(root=ROOT, replacement_package=None, *, build_dir=None, report_dir=
         'layout': native.LAYOUT, 'effective_config': {k: config[k] for k in SAFETY},
         'provenance': {'mode': 'exact-source-and-effective-build-configuration',
                        'build_report_sha256': digest(report_file),
-                       'sdkconfig_sha256': digest(project / 'sdkconfig'),
+                       'sdkconfig_sha256': digest(config_path),
                        'partition_table_sha256': digest(table),
                        'elf_file_sha256': digest(image_path.with_suffix('.elf')),
                        'rtc_diagnostic_symbols': report.get('rtc_diagnostic_symbols', []),
@@ -146,9 +150,12 @@ def main(argv=None):
                    help='known VALID B-slot release for later explicit A-baseline replacement; no device access')
     p.add_argument('--build-dir', type=Path, help='isolated completed candidate build directory')
     p.add_argument('--report-dir', type=Path, help='matching isolated completed-build reports')
+    p.add_argument('--isolated-config', action='store_true',
+                   help='validate the compiled sdkconfig inside --build-dir')
     a = p.parse_args(argv)
     manifest = generate(replacement_package=a.replacement_package,
-                        build_dir=a.build_dir, report_dir=a.report_dir)
+                        build_dir=a.build_dir, report_dir=a.report_dir,
+                        isolated_config=a.isolated_config)
     if a.output.exists():
         p.error('release directory already exists')
     # Bundle helper validates all app fields and copies a self-contained runner.

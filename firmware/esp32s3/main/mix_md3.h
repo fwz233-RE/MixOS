@@ -15,8 +15,10 @@
  * touch target is 48 dp; these were a quarter of it in one axis and a sixth in
  * the other, which is the whole explanation for controls that cannot be hit.
  *
- * So sizes here are written in dp and sp and converted once, and MIX_TOUCH_MIN
- * is the floor that every interactive element has to clear.
+ * So sizes here are written in dp and sp and converted once. MIX_TOUCH_MIN
+ * is the 48dp target used by the launcher, navigation, theme picker, ordinary
+ * settings buttons and the section rail. Legacy confirmation-dialog controls
+ * are smaller; this header does not establish full accessibility conformance.
  *
  * The conversion rounds rather than truncates: MIX_DP(9) is 23 px, not 22.
  */
@@ -59,9 +61,9 @@
 #define MIX_APPBAR_H MIX_DP(64)
 
 /* ---------- type scale ---------- */
-/* Material 3 type scale, in sp. Only the steps this interface actually uses
- * are listed, so an unused size cannot drift out of step with the font cache
- * in mix_lv_font.c, which instantiates exactly these. */
+/* Material 3 type scale, in sp. These tokens are shared by the framebuffer
+ * interface and the separate LVGL font adapter; not every custom UI size is
+ * an official type-scale role or instantiated by that adapter. */
 #define MIX_TYPE_HEADLINE_S MIX_SP(24)
 #define MIX_TYPE_TITLE_L    MIX_SP(22)
 #define MIX_TYPE_TITLE_M    MIX_SP(16)
@@ -102,8 +104,9 @@ typedef struct {
     const char *name_zh;
 } mix_md3_scheme_t;
 
-#define MIX_THEME_COUNT 4
+#define MIX_THEME_COUNT 12
 
-/* The four schemes, keeping the established identities: graphite mint, paper
- * forest, midnight blue, warm ember. */
+/* Twelve hand-authored Material 3-style presets, retaining the original four
+ * identities at indices 0..3 for persisted preferences. These are not output
+ * from Material Theme Builder or the official HCT colour generation library. */
 extern const mix_md3_scheme_t mix_md3_schemes[MIX_THEME_COUNT];

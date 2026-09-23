@@ -5,27 +5,41 @@
 #include <stdio.h>
 #include <string.h>
 static mix_kbd_transport_t stm;
-static unsigned transactions, reads, emitted;
-static uint8_t output[4096];
-static bool fail_read, fail_ack, inject, corrupt_seq, bad_version, corrupt_crc, reset_on_text;
+static unsigned transactions, reads, emitted, backlight_writes, actions[7];
+static uint8_t output[4096], applied_backlight;
+static int saved_lock_level;
+static bool fail_read, fail_ack, fail_backlight, inject, corrupt_seq, bad_version, corrupt_crc, reset_on_text;
+static bool in_callback, lock_on_key, defer_apply;
+static void apply_pending(void) {
+    if (stm.backlight_pending) {
+        applied_backlight=stm.pending_backlight;
+        stm.backlight_pending=false;
+    }
+}
 /* The driver reaches the bus through mix_i2c, which owns the bus handle and
  * serialises every transfer, so the fakes live at that boundary now. They keep
  * the same assertions the previous IDF-level fakes made: the slave address,
  * the 400 kHz rate, the single-register read of a whole frame, and the 5 ms
- * deadline are all still checked here. */
+ * deadline are all still checked here. No transfer may run inside a callback. */
 i2c_master_dev_handle_t mix_i2c_add_device(uint8_t address, uint32_t scl_hz) {
-    assert(address==0x1f && scl_hz==400000); return (void *)2;
+    assert(!in_callback && address==0x1f && scl_hz==400000); return (void *)2;
 }
-esp_err_t mix_i2c_rm_device(i2c_master_dev_handle_t d) { assert(d); return ESP_OK; }
+esp_err_t mix_i2c_rm_device(i2c_master_dev_handle_t d) { assert(!in_callback && d); return ESP_OK; }
 esp_err_t mix_i2c_transmit(i2c_master_dev_handle_t d,const uint8_t *p,size_t n,int timeout) {
-    assert(d && timeout==5); ++transactions;
+    assert(!in_callback && d && timeout==5); ++transactions;
     if (fail_ack && p[0]==0x11) return ESP_FAIL;
+    if (p[0]==KBD_CMD_BACKLIGHT) {
+        assert(n==2 && p[1]<=8); ++backlight_writes;
+        if (fail_backlight) return ESP_FAIL;
+    }
     mix_kbd_transport_write(&stm,p,n);
-    if(stm.backlight_pending) { stm.backlight=stm.pending_backlight; stm.backlight_pending=false; }
+    // Production publishes requested feedback before its housekeeping task
+    // applies PWM. Keep that distinction visible rather than faking an ACK.
+    if (!defer_apply) apply_pending();
     return ESP_OK;
 }
 esp_err_t mix_i2c_read(i2c_master_dev_handle_t d,uint8_t reg,uint8_t *out,size_t len,int timeout) {
-    assert(d && reg==0 && len==KBD_V1_FRAME && timeout==5); ++transactions; ++reads;
+    assert(!in_callback && d && reg==0 && len==KBD_V1_FRAME && timeout==5); ++transactions; ++reads;
     if (fail_read) return ESP_FAIL;
     mix_kbd_transport_frame(&stm,out);
     if (bad_version) out[1]=0;
@@ -40,18 +54,177 @@ esp_err_t mix_i2c_read(i2c_master_dev_handle_t d,uint8_t reg,uint8_t *out,size_t
 }
 static void cb(int a,const uint8_t *p,size_t n,void *ctx) {
     (void)ctx;
+    assert(!in_callback && a>=0 && a<7);
+    in_callback=true;
+    unsigned before=transactions;
+    int reported=mix_keyboard_backlight_level();
+    assert(reported>=0 && reported<=8);
+    ++actions[a];
     if (a==MIX_KEY_BACKLIGHT) mix_keyboard_backlight_step();
-    if (a!=MIX_KEY_TEXT) return;
-    assert(emitted+n<=sizeof(output)); memcpy(output+emitted,p,n); emitted+=(unsigned)n;
-    if (reset_on_text) mix_keyboard_reset_input();
+    if (a==MIX_KEY_LOCK && lock_on_key) {
+        saved_lock_level=reported;
+        mix_keyboard_backlight_set(0);
+        mix_keyboard_reset_input();
+    }
+    if (a==MIX_KEY_TEXT) {
+        assert(emitted+n<=sizeof(output)); memcpy(output+emitted,p,n); emitted+=(unsigned)n;
+        if (reset_on_text) mix_keyboard_reset_input();
+    }
+    assert(transactions==before && mix_keyboard_backlight_level()==reported);
+    in_callback=false;
 }
-static void tick(uint32_t now) { transactions=0; mix_keyboard_tick(now); assert(transactions<=3); }
+static void tick(uint32_t now) {
+    transactions=0; mix_keyboard_tick(now); assert(transactions<=3 && !in_callback);
+    int level=mix_keyboard_backlight_level();
+    assert(mix_keyboard_online() ? (level>=0 && level<=8) : level==-1);
+}
 static void edge(unsigned r,unsigned c,bool down) { mix_kbd_transport_event(&stm,(uint8_t)r,(uint8_t)c,down); }
-static void setup(void) {
-    mix_kbd_transport_init(&stm); emitted=reads=0;
-    fail_read=fail_ack=inject=corrupt_seq=bad_version=corrupt_crc=reset_on_text=false;
+static void tap(unsigned r,unsigned c) { edge(r,c,true); edge(r,c,false); }
+static void init_driver(void) {
+    mix_kbd_transport_init(&stm); emitted=reads=backlight_writes=transactions=0;
+    memset(actions,0,sizeof(actions));
+    fail_read=fail_ack=fail_backlight=inject=corrupt_seq=bad_version=corrupt_crc=reset_on_text=false;
+    in_callback=lock_on_key=defer_apply=false;
+    applied_backlight=3; saved_lock_level=-1;
     assert(mix_keyboard_init(cb,NULL)==ESP_OK);
+    assert(!mix_keyboard_online() && mix_keyboard_backlight_level()==-1);
+}
+static void setup(void) {
+    init_driver();
     tick(0); assert(!mix_keyboard_online()); tick(20); assert(mix_keyboard_online());
+    assert(mix_keyboard_backlight_level()==3);
+}
+static void test_screen_keys(void) {
+    const uint8_t columns[]={1,2,3,7,8,9};
+    const int expected[]={MIX_KEY_LOCK,MIX_KEY_VOLUME_DOWN,MIX_KEY_VOLUME_UP,MIX_KEY_BRIGHT_DOWN,MIX_KEY_BRIGHT_UP,MIX_KEY_BACKLIGHT};
+    assert(MIX_KEY_HOME==MIX_KEY_LOCK);
+    for (unsigned i=0;i<sizeof(columns);++i) {
+        setup(); edge(0,columns[i],true); edge(0,columns[i],true); tick(40); tick(500);
+        assert(!emitted && actions[expected[i]]==1);
+        for (int a=1;a<7;++a) assert(actions[a]==(unsigned)(a==expected[i]));
+        edge(0,columns[i],false); edge(0,columns[i],false); tick(520);
+        tap(0,columns[i]); tick(540); assert(actions[expected[i]]==2);
+    }
+    setup(); edge(3,0,true); tap(0,9); tick(40); tick(500);
+    edge(3,0,false); edge(5,0,true); tap(0,9); tick(520); tick(1000);
+    assert(!actions[MIX_KEY_BACKLIGHT] && !backlight_writes && !emitted);
+    setup(); edge(3,0,true);
+    for (unsigned c=3;c<=7;++c) edge(5,c,true);
+    tick(40); tick(500); assert(actions[MIX_KEY_BACKLIGHT]==1 && backlight_writes==1 && !emitted);
+    for (unsigned c=3;c<=7;++c) edge(5,c,false);
+    tick(520); tap(5,7); tick(540); assert(actions[MIX_KEY_BACKLIGHT]==2 && !emitted);
+}
+static void test_backlight_queue(void) {
+    // Offline absolute sets queue, offline steps do not, and no API does I2C.
+    init_driver(); mix_keyboard_backlight_set(7); mix_keyboard_backlight_step();
+    assert(!transactions && mix_keyboard_backlight_level()==-1);
+    tick(0); assert(!mix_keyboard_online() && !backlight_writes);
+    tick(20); assert(stm.backlight==7 && backlight_writes==1 && mix_keyboard_backlight_level()==3);
+    tick(40); assert(mix_keyboard_backlight_level()==7);
+    tick(60); assert(backlight_writes==1);
+    for (uint8_t level=0;level<=8;++level) {
+        setup(); unsigned before=transactions; mix_keyboard_backlight_set(level);
+        assert(transactions==before && mix_keyboard_backlight_level()==3);
+        tick(40); assert(stm.backlight==level && backlight_writes==1 && mix_keyboard_backlight_level()==3);
+        tick(60); assert(mix_keyboard_backlight_level()==level);
+        tick(80); assert(backlight_writes==1);
+    }
+    setup(); mix_keyboard_backlight_set(9); mix_keyboard_backlight_set(255);
+    tick(40); assert(!backlight_writes && mix_keyboard_backlight_level()==3);
+    mix_keyboard_backlight_set(6); mix_keyboard_backlight_set(9); mix_keyboard_backlight_step();
+    tick(60); assert(stm.backlight==7 && backlight_writes==1);
+    tick(80); assert(mix_keyboard_backlight_level()==7);
+    setup(); unsigned before=transactions;
+    for (unsigned i=0;i<9;++i) mix_keyboard_backlight_step();
+    assert(transactions==before); tick(40); assert(!backlight_writes);
+    for (unsigned i=0;i<20;++i) mix_keyboard_backlight_step();
+    tick(60); assert(stm.backlight==5 && backlight_writes==1);
+    tick(80); assert(mix_keyboard_backlight_level()==5);
+    // Steps use the next report, rather than a possibly stale cached level.
+    setup(); stm.backlight=8; mix_keyboard_backlight_step();
+    tick(40); assert(stm.backlight==0 && mix_keyboard_backlight_level()==8);
+    tick(60); assert(mix_keyboard_backlight_level()==0);
+    mix_keyboard_backlight_step(); tick(80); assert(stm.backlight==1);
+    // A lock set cancels every older queued step; none can replay later.
+    setup(); mix_keyboard_backlight_step(); mix_keyboard_backlight_step(); mix_keyboard_backlight_set(0);
+    tick(40); assert(stm.backlight==0 && backlight_writes==1);
+    tick(60); tick(80); assert(mix_keyboard_backlight_level()==0 && backlight_writes==1);
+    // Intentionally newer steps add to the pending set, with modulo wrap.
+    setup(); mix_keyboard_backlight_set(8); mix_keyboard_backlight_step();
+    tick(40); assert(stm.backlight==0 && backlight_writes==1);
+    setup(); mix_keyboard_backlight_set(2); mix_keyboard_backlight_step();
+    mix_keyboard_backlight_set(6); mix_keyboard_backlight_step();
+    tick(40); assert(stm.backlight==7 && backlight_writes==1);
+    setup(); mix_keyboard_backlight_set(0); mix_keyboard_backlight_set(6);
+    tick(40); assert(stm.backlight==6 && backlight_writes==1);
+    // Resetting input must not throw away the lock's queued absolute command.
+    setup(); mix_keyboard_backlight_set(0); mix_keyboard_reset_input();
+    tick(40); assert(stm.backlight==0); tick(60); assert(mix_keyboard_backlight_level()==0);
+    // Driver reinitialisation deliberately clears all pending work.
+    setup(); mix_keyboard_backlight_set(0); mix_keyboard_backlight_step();
+    assert(mix_keyboard_init(cb,NULL)==ESP_OK && mix_keyboard_backlight_level()==-1);
+    tick(40); tick(60); assert(stm.backlight==3 && !backlight_writes);
+    // The STM32 protocol exposes requested, NOT hardware-applied, brightness.
+    setup(); defer_apply=true; mix_keyboard_backlight_set(8);
+    tick(40); assert(stm.backlight==8 && stm.backlight_pending && applied_backlight==3);
+    assert(mix_keyboard_backlight_level()==3); // no optimistic update on write
+    tick(60); assert(mix_keyboard_backlight_level()==8 && applied_backlight==3);
+    apply_pending(); assert(applied_backlight==8);
+}
+static void test_lock_callback(void) {
+    setup(); lock_on_key=true;
+    mix_keyboard_backlight_step(); tap(0,9); edge(0,1,true); tap(0,9); tap(2,1);
+    tick(40);
+    assert(actions[MIX_KEY_LOCK]==1 && actions[MIX_KEY_BACKLIGHT]==1 && !emitted);
+    assert(saved_lock_level==3 && stm.backlight==0 && backlight_writes==1 && transactions==3);
+    assert(mix_keyboard_backlight_level()==3);
+    tick(60); assert(mix_keyboard_backlight_level()==0 && backlight_writes==1);
+    edge(2,1,true); tick(80); assert(!emitted); // still waiting for LOCK release
+    edge(0,1,false); edge(2,1,false); tick(100); assert(!emitted);
+    tap(3,1); tick(120); assert(emitted==1 && output[0]=='a');
+    mix_keyboard_backlight_set((uint8_t)saved_lock_level);
+    tick(140); assert(stm.backlight==3 && mix_keyboard_backlight_level()==0);
+    tick(160); assert(mix_keyboard_backlight_level()==3 && backlight_writes==2);
+}
+static void test_backlight_failures(void) {
+    // Absolute intent survives read errors; old steps do not survive reconnect.
+    setup(); mix_keyboard_backlight_set(0); mix_keyboard_backlight_step(); fail_read=true;
+    tick(40); assert(!mix_keyboard_online() && !backlight_writes);
+    fail_read=false; mix_keyboard_backlight_step();
+    mix_keyboard_backlight_set(6); mix_keyboard_backlight_set(0);
+    unsigned before=reads; tick(1039); assert(reads==before);
+    tick(1040); tick(1060); assert(stm.backlight==0 && backlight_writes==1 && mix_keyboard_backlight_level()==3);
+    tick(1080); assert(mix_keyboard_backlight_level()==0);
+    // A failed input ACK does not lose a pending lock set or emit input.
+    setup(); mix_keyboard_backlight_set(0); mix_keyboard_backlight_step(); edge(2,1,true); fail_ack=true;
+    tick(40); assert(!mix_keyboard_online() && !emitted && !backlight_writes);
+    fail_ack=false; tick(1040); tick(1060);
+    assert(stm.backlight==0 && backlight_writes==1 && !emitted);
+    tick(1080); assert(mix_keyboard_backlight_level()==0 && !emitted);
+    // A failed set write is retried only after a new session, without its steps.
+    setup(); mix_keyboard_backlight_set(0); mix_keyboard_backlight_step(); fail_backlight=true;
+    tick(40); assert(!mix_keyboard_online() && stm.backlight==3 && backlight_writes==1);
+    fail_backlight=false; tick(1040); tick(1060);
+    assert(stm.backlight==0 && backlight_writes==2 && mix_keyboard_backlight_level()==3);
+    tick(1080); assert(mix_keyboard_backlight_level()==0);
+    // Failed step-only writes are not replayed after reconnect.
+    setup(); mix_keyboard_backlight_step(); fail_backlight=true;
+    tick(40); assert(!mix_keyboard_online() && backlight_writes==1);
+    fail_backlight=false; tick(1040); tick(1060);
+    assert(stm.backlight==3 && backlight_writes==1 && mix_keyboard_backlight_level()==3);
+    // MCU reset also invalidates feedback and steps, but preserves a queued set.
+    setup(); mix_keyboard_backlight_set(0); mix_keyboard_backlight_step(); mix_kbd_transport_init(&stm);
+    tick(40); assert(!mix_keyboard_online() && !backlight_writes);
+    tick(60); assert(stm.backlight==0 && backlight_writes==1 && mix_keyboard_backlight_level()==3);
+    tick(80); assert(mix_keyboard_backlight_level()==0);
+    setup(); mix_keyboard_backlight_step(); mix_kbd_transport_init(&stm);
+    tick(40); tick(60); assert(stm.backlight==3 && !backlight_writes);
+    // A CRC-valid out-of-range report is rejected, never exposed or used.
+    setup(); mix_keyboard_backlight_set(0); mix_keyboard_backlight_step(); stm.backlight=9;
+    tick(40); assert(!mix_keyboard_online() && !backlight_writes);
+    mix_kbd_transport_init(&stm); tick(1040); tick(1060);
+    assert(stm.backlight==0 && backlight_writes==1 && mix_keyboard_backlight_level()==3);
+    tick(1080); assert(mix_keyboard_backlight_level()==0);
 }
 int main(void) {
     setup(); edge(2,1,true); edge(2,1,false); tick(40); assert(emitted==1 && output[0]=='q' && !stm.count);
@@ -84,6 +257,10 @@ int main(void) {
     reset_on_text=false; tick(60); edge(3,1,true); edge(3,1,false); tick(80); assert(emitted==2);
     setup(); bad_version=true; tick(40); assert(!mix_keyboard_online() && !emitted);
     setup(); edge(2,1,true); corrupt_crc=true; tick(40); assert(!mix_keyboard_online() && !emitted && stm.count==1);
-    puts("driver: bounded polling, offline throttle, ACK failure, overflow, reset, all-up race, session, sequence wrap passed");
+    test_screen_keys();
+    test_backlight_queue();
+    test_lock_callback();
+    test_backlight_failures();
+    puts("driver: lock layout, callback-safe backlight queue/feedback, offline/reconnect, rescue, ACK/release/repeat protection passed");
     return 0;
 }

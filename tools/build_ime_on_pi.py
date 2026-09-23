@@ -79,7 +79,8 @@ LAUNCHER = '/usr/local/lib/mixos/apps/notes'
 # missing essay.txt shows up here as rare single characters instead.
 PINYIN = b'nihao'
 EXPECTED = '你好'
-TOGGLE = b'\x01 '                       # Ctrl-A then Space: English <-> Chinese
+TOGGLE = b'\x01 '                       # Upstream shortcut retained for compatibility
+DEVICE_TOGGLE = b'\x1b[32;2u'            # Physical Shift+Space forwarded by MixOS
 
 AUDIT: Path | None = None
 
@@ -689,11 +690,12 @@ def verify_notes(root: Path, user: str, environment: dict) -> dict:
     notes_dir.mkdir(parents=True)
     hand_to_user(notes_dir, user)
     child_environment = dict(environment, MIXOS_NOTES_DIR=str(notes_dir),
-                             TERM='xterm-256color')
+                             TERM='mixos')
 
-    evidence: dict = {'notes_dir': str(notes_dir)}
+    evidence: dict = {'notes_dir': str(notes_dir), 'columns': 48, 'rows': 16,
+                      'toggle': DEVICE_TOGGLE.hex()}
     terminal = Terminal(as_user(user, ['/bin/sh', LAUNCHER]), child_environment,
-                        columns=64, rows=22)
+                        columns=48, rows=16)
 
     def step(name: str, marker: str, seconds: float) -> None:
         """Wait for the screen to show that a step happened, or say what it showed.
@@ -723,7 +725,7 @@ def verify_notes(root: Path, user: str, environment: dict) -> dict:
         # the order a person ends up in, and it is the case that used to be
         # broken: with the input method in Chinese mode the list's letters are
         # pinyin, so 'n' composed a syllable instead of making a note.
-        terminal.send(TOGGLE, settle=1.0)
+        terminal.send(DEVICE_TOGGLE, settle=1.0)
         terminal.send(b'\x0e', settle=0.8)                  # Ctrl-N, a new note
         # The editor's footer. Waiting for it is what distinguishes "the editor
         # opened" from "the keystroke was swallowed", which otherwise shows up
@@ -733,10 +735,18 @@ def verify_notes(root: Path, user: str, environment: dict) -> dict:
             terminal.send(bytes([byte]), settle=0.35)
         step('candidate_bar', EXPECTED, 20.0)
         terminal.send(b' ', settle=1.2)                    # commit it
+        terminal.send(DEVICE_TOGGLE, settle=0.6)            # English
+        terminal.send(b'MixOS', settle=0.6)
         terminal.send(b'\x13', settle=1.0)                 # Ctrl-S, save
         step('saved', 'saved', 15.0)
-        terminal.send(b'\x11', settle=1.2)                 # Ctrl-Q, back to the list
-        terminal.send(b'\x11', settle=1.5)                 # Ctrl-Q again, and out
+        terminal.send(DEVICE_TOGGLE, settle=0.6)            # Chinese again
+        terminal.send(b'ni', settle=0.6)                    # unfinished syllable
+        terminal.text = ''
+        terminal.send(b'\x11', settle=1.2)                 # cancel composition, Back
+        step('back_to_list', '新建', 15.0)
+        terminal.text = ''
+        terminal.send(b'\x11', settle=1.2)                 # root remains open
+        step('back_stays_at_root', '已到笔记列表', 15.0)
         evidence['frame_tail'] = strip_escapes(terminal.text)[-1200:]
     finally:
         evidence['exit_status'] = terminal.close()
@@ -746,9 +756,9 @@ def verify_notes(root: Path, user: str, environment: dict) -> dict:
     texts = {path.name: path.read_text(encoding='utf-8', errors='replace')
              for path in saved}
     evidence['contents'] = texts
-    if not any(EXPECTED in text for text in texts.values()):
+    if not any(text.strip() == EXPECTED + 'MixOS' for text in texts.values()):
         audit('notes_chinese_failed', **evidence)
-        raise RuntimeError(f'No saved note contains {EXPECTED}. Files: '
+        raise RuntimeError(f'No saved note exactly contains {EXPECTED}MixOS. Files: '
                            f'{evidence["files"]}')
     audit('notes_chinese_verified', **evidence)
     return evidence

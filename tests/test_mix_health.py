@@ -192,30 +192,38 @@ class HealthTests(unittest.TestCase):
         # Reuse unchanged preview fixture stubs in a TEMPORARY translation unit.
         # No production/fixture files are rewritten and no new device ABI is invented.
         fixture = (ROOT / "tests/test_preview_ui_host.c").read_text(encoding="utf-8")
-        fixture = fixture.replace('#include "../firmware/esp32s3/main/mix_ui.c"', '#include "mix_ui.c"')
-        fixture = fixture.replace("static unsigned draws, full_draws, allocations;",
-                                  "static esp_err_t injected_draw_result;\nstatic unsigned draws, full_draws, allocations;")
-        self.assertIn("last_y0 = y0; last_y1 = y1; return ESP_OK;", fixture)
-        fixture = fixture.replace("last_y0 = y0; last_y1 = y1; return ESP_OK;",
-                                  "last_y0 = y0; last_y1 = y1; return injected_draw_result;")
-        fixture = fixture.replace("int main(void) {", "int preview_original_main(void) {", 1)
+        include = '#include "../firmware/esp32s3/main/mix_ui.c"'
+        self.assertIn(include, fixture)
+        fixture = fixture.replace(include, '#include "mix_ui.c"', 1)
+        fixture = fixture.replace('#include "../firmware/esp32s3/main/', '#include "')
+        # Use the fixture's shared single/batch failure hook instead of
+        # rewriting a whitespace-sensitive return statement in its presenter.
+        self.assertIn("static esp_err_t next_draw_error;", fixture)
+        self.assertEqual(fixture.count("int main("), 1)
+        fixture = fixture.replace("int main(", "int preview_original_main(", 1)
         fixture += r'''
 int main(void) {
     assert(!mix_ui_draw_healthy());
     assert(mix_ui_last_draw_error()==ESP_ERR_INVALID_STATE);
     mix_terminal_init();assert(mix_ui_init((void *)1)==ESP_OK);note_geometry();
-    mix_view_t v={0};injected_draw_result=ESP_FAIL;
+    mix_view_t v={0};next_draw_error=ESP_FAIL;
     mix_ui_tick(&v,step(1));assert(!mix_ui_draw_healthy()&&repaint);
     assert(mix_ui_last_draw_error()==ESP_FAIL);
-    injected_draw_result=ESP_OK;mix_ui_tick(&v,step(1));
+    next_draw_error=ESP_OK;mix_ui_tick(&v,step(1));
     assert(mix_ui_draw_healthy()&&!repaint&&first_frame_presented);
-    injected_draw_result=ESP_ERR_INVALID_ARG;present(10,20);
+    next_draw_error=ESP_ERR_INVALID_ARG;present(10,20);
     assert(!mix_ui_draw_healthy()&&repaint);
-    injected_draw_result=ESP_OK;present(10,20);
+    next_draw_error=ESP_OK;present(10,20);
     assert(!mix_ui_draw_healthy()); /* partial success never masks a failed frame */
     mix_ui_tick(&v,step(1));assert(mix_ui_draw_healthy()&&!repaint);
     unsigned count=draws;mix_ui_tick(&v,step(1));
     assert(count==draws&&mix_ui_draw_healthy()); /* static screen is valid */
+    const mix_present_rect_t regions[2]={{20,30,60,70},{90,100,130,140}};
+    next_draw_error=ESP_FAIL;present_batch(regions,2);
+    assert(draws==count+1&&!mix_ui_draw_healthy()&&repaint);
+    assert(mix_ui_last_draw_error()==ESP_FAIL);
+    present_batch(regions,2);assert(!mix_ui_draw_healthy()&&repaint);
+    mix_ui_tick(&v,step(1));assert(mix_ui_draw_healthy()&&!repaint);
     puts("UI draw failure recovery passed");return 0;
 }
 '''
@@ -228,7 +236,7 @@ int main(void) {
         self.assertLess(app.index("mix_health_init()"), app.index("nvs_flash_init()"))
         self.assertLess(app.index("nvs_flash_init()"), app.index("mix_ota_init()"))
         self.assertLess(app.index("mix_ota_init()"), app.index("mix_ota_init_worker()"))
-        self.assertLess(app.index("mix_ui_tick(&view,ms)"), app.index("mix_ota_health_tick("))
+        self.assertLess(app.index("mix_ui_tick(&view,clock_ms())"), app.index("mix_ota_health_tick("))
         self.assertIn("mix_ota_local_health_tick(ms,local_healthy);", app)
         self.assertIn("mix_ota_health_tick(ms,local_healthy&&mix_link_host_healthy(ms));", app)
         self.assertIn("draw&&rgb_progress_healthy(ms)&&mix_health_usb_ready()&&mix_health_progress_ok(ms)", app)
@@ -258,10 +266,18 @@ int main(void) {
                         "BOOTLOADER_WDT_ENABLE", "BOOTLOADER_WDT_DISABLE_IN_USER_CODE"):
                 self.assertIn(f"CONFIG_{key}=y", config)
             self.assertIn("CONFIG_BOOTLOADER_WDT_TIME_MS=30000", config)
+            self.assertIn('CONFIG_COMPILER_OPTIMIZATION_PERF=y', config)
+            self.assertNotIn('CONFIG_COMPILER_OPTIMIZATION_DEBUG=y', config)
             self.assertIn("CONFIG_ESP_TASK_WDT_TIMEOUT_S=15", config)
+        pins = (MAIN / 'board_pins.h').read_text(encoding='utf-8')
+        self.assertRegex(pins, r'#define\s+LCD_PCLK_HZ\s+\(26\s*\*\s*1000\s*\*\s*1000\)')
         main = (MAIN / "main.c").read_text(encoding="utf-8")
-        self.assertIn(".num_fbs=2,.bounce_buffer_size_px=LCD_H_RES*16", main)
+        self.assertIn(".data_width=16,.bits_per_pixel=16,.num_fbs=2,.bounce_buffer_size_px=LCD_H_RES*LCD_BOUNCE_LINES", main)
         self.assertIn(".pclk_hz=LCD_PCLK_HZ,.h_res=LCD_H_RES,.v_res=LCD_V_RES", main)
+        self.assertIn('#include "board_pins.h"', main)
+        self.assertRegex(pins, r'#define\s+LCD_BOUNCE_LINES\s+16\b')
+        self.assertRegex(pins, r'#define\s+LCD_H_RES\s+1024\b')
+        self.assertRegex(pins, r'#define\s+LCD_V_RES\s+768\b')
         config = (MAIN.parent / "sdkconfig").read_text(encoding="utf-8")
         self.assertIn("CONFIG_SPIRAM_FETCH_INSTRUCTIONS=y", config)
         self.assertIn("CONFIG_SPIRAM_RODATA=y", config)

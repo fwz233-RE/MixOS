@@ -48,6 +48,13 @@ if [ -x "$IME" ] && [ -x "$APP" ] && [ -d "$RIME_DATA" ]; then
   "log_level": "warn"
 }
 EOF
+    # Only the MixOS notes route emits the device's Shift+Space CSI u key.
+    # Other terminals keep term-ime's upstream Ctrl+A, then Space hint.
+    if [ "${TERM:-}" = mixos ]; then
+        export MIXOS_IME_SHORTCUT=Shift+Space
+    else
+        unset MIXOS_IME_SHORTCUT
+    fi
     exec "$IME" "$CONFIG"
 fi
 

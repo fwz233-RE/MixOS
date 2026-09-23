@@ -25,6 +25,11 @@ void mix_i2c_lock(void)
     if (s_lock) xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
 }
 
+bool mix_i2c_try_lock(void)
+{
+    return s_lock && xSemaphoreTakeRecursive(s_lock, 0) == pdTRUE;
+}
+
 void mix_i2c_unlock(void)
 {
     if (s_lock) xSemaphoreGiveRecursive(s_lock);

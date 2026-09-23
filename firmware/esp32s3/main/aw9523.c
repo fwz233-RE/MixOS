@@ -270,23 +270,27 @@ bool aw9523_state_matches(i2c_master_dev_handle_t dev)
 // 结束立即还回输入交还 GT911。
 esp_err_t aw9523_gt911_reset(i2c_master_dev_handle_t dev)
 {
-    /* Each step is propagated rather than aborted: main.c treats a failed
-     * touch reset as "no touch panel" and keeps the rest of the UI running. */
-    // RST=0、INT=0（INT 暂时改输出低，R20 10K 上拉下灌 ~0.33mA 无害）
-    AW_TRY(aw9523_update_bits(dev, AW9523_REG_OUTPUT_P1,
-                              AW9523_P1_TP_RST | AW9523_P1_TP_INT, 0x00));
-    AW_TRY(aw9523_update_bits(dev, AW9523_REG_CONFIG_P1,
-                              AW9523_P1_TP_INT, 0x00));   // INT 转输出
-    vTaskDelay(pdMS_TO_TICKS(20));
-    // 释放 RST，INT 保持低 → 固件以 0x5D 地址干净重启（NVM 厂家配置正常加载）
-    AW_TRY(aw9523_update_bits(dev, AW9523_REG_OUTPUT_P1,
-                              AW9523_P1_TP_RST, AW9523_P1_TP_RST));
-    vTaskDelay(pdMS_TO_TICKS(50));
-    // INT 还回输入（高阻，交还 GT911 驱动）。这一步即使前面失败也必须尝试，
-    // 否则 INT 会被永久钉在输出低，GT911 再也无法上报中断。
+    /* Serialize the full pin sequence against expander health recovery.
+     * Always restore RST high and INT input, even after an early I2C error. */
+    aw_lock();
+    esp_err_t err = aw9523_update_bits(dev, AW9523_REG_OUTPUT_P1,
+                                      AW9523_P1_TP_RST | AW9523_P1_TP_INT, 0);
+    if (err == ESP_OK)
+        err = aw9523_update_bits(dev, AW9523_REG_CONFIG_P1, AW9523_P1_TP_INT, 0);
+    if (err == ESP_OK) vTaskDelay(pdMS_TO_TICKS(20));
+    esp_err_t rst = aw9523_update_bits(dev, AW9523_REG_OUTPUT_P1,
+                                      AW9523_P1_TP_RST, AW9523_P1_TP_RST);
+    if (err == ESP_OK) err = rst;
+    if (err == ESP_OK) vTaskDelay(pdMS_TO_TICKS(50));
     esp_err_t release = aw9523_update_bits(dev, AW9523_REG_CONFIG_P1,
-                                           AW9523_P1_TP_INT, AW9523_P1_TP_INT);
+                                          AW9523_P1_TP_INT, AW9523_P1_TP_INT);
+    /* A failed read-modify-write still leaves a safe desired state for the
+     * expander health task to restore, rather than keeping reset asserted. */
+    s_expected_out1 |= AW9523_P1_TP_RST;
+    s_expected_cfg1 |= AW9523_P1_TP_INT;
+    if (err == ESP_OK) err = release;
     vTaskDelay(pdMS_TO_TICKS(120));
-    return release;
+    aw_unlock();
+    return err;
 }
 

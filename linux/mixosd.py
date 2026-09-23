@@ -5,6 +5,7 @@ from collections import deque
 import errno
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import selectors
@@ -30,12 +31,16 @@ SERIAL_WRITE_BUDGET = 8192
 APP_NAMES = ('shell', 'translate', 'notes', 'agent')
 NETCTL_HELPER = str(Path(__file__).resolve().parent / 'netctl.py')
 NET_TIMEOUTS = {
-    T.NET_SCAN: 30.0,
+    # Scan's 16-second budget plus helper overhead/kill grace must fit within
+    # the device's 20-second NET request deadline, even on helper failure.
+    T.NET_SCAN: 17.0,
     T.NET_CONNECT: 50.0,
     T.NET_FORGET: 10.0,
     'state': 12.0,
 }
 STATE_REFRESH = 10.0
+WIFI_STATE_MAX_AGE = 15.0
+WIFI_SAMPLE_MAX_GAP = 6.0
 
 
 class QueueFull(Exception):
@@ -75,23 +80,122 @@ class WriteQueue:
 
 
 class HostMetrics:
-    def __init__(self):
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
         self.previous = None
         self.wifi = None
         self.address = ''
+        self.wifi_interface = None
+        self.wifi_state_at = None
+        self.wifi_counter = None
+        self.wifi_counter_at = None
+        self.wifi_link = None
+        self.last_sample_at = None
 
-    def report_network(self, state, address):
-        """Latest asynchronous network answer; None means still unknown."""
-        self.wifi = state
+    def _reset_wifi_counter(self):
+        self.wifi_counter = None
+        self.wifi_counter_at = None
+        self.wifi_link = None
+
+    @staticmethod
+    def _bounded_ssid(value):
+        """Limit the SSID by UTF-8 bytes before JSON escaping it."""
+        return str(value).encode('utf-8', 'replace')[:netctl.SSID_MAX].decode('utf-8', 'ignore')
+
+    def report_network(self, state, address, observed_at=None):
+        """Publish asynchronous NetworkManager identity, never rate samples.
+
+        The helper records its observation time before the separate IP query.
+        Both processes use Linux's system-wide monotonic clock.
+        """
+        now = self.clock()
+        at = now if observed_at is None else observed_at
+        if (type(at) not in (int, float) or not math.isfinite(at) or
+                not math.isfinite(now) or not 0 <= now - at <= WIFI_STATE_MAX_AGE):
+            state, address = None, ''
+        if not isinstance(state, dict):
+            self.wifi = None
+            self.wifi_interface = None
+            self.wifi_state_at = None
+            self._reset_wifi_counter()
+        else:
+            state = dict(state)
+            if self.wifi_state_at is not None and at < self.wifi_state_at:
+                self.wifi_state_at = None
+                self._reset_wifi_counter()
+                return
+            connected = bool(state.get('connected'))
+            interface = state.get('interface')
+            if not netctl._valid_interface(interface):
+                interface = None
+            changed = (self.wifi is None or
+                       connected != bool(self.wifi.get('connected')) or
+                       interface != self.wifi_interface or
+                       state.get('ssid', '') != self.wifi.get('ssid', ''))
+            fresh = (self.wifi_state_at is not None and
+                     0 <= now - self.wifi_state_at <= WIFI_STATE_MAX_AGE)
+            clock_regressed = (self.last_sample_at is not None and
+                               (not math.isfinite(self.last_sample_at) or now < self.last_sample_at))
+            self.wifi = state
+            self.wifi_interface = interface
+            self.wifi_state_at = at
+            if not connected or interface is None or changed or not fresh or clock_regressed:
+                self._reset_wifi_counter()
         self.address = address or ''
 
     @staticmethod
-    def _timezone_offset_min():
-        local = time.localtime()
-        seconds = -(time.altzone if (time.daylight and local.tm_isdst > 0) else time.timezone)
+    def _timezone_offset_min(timestamp):
+        # Linux caches timezone rules in this long-lived process. Reload them
+        # after an operator changes /etc/localtime (or the process's TZ), then
+        # use the offset for the SAME instant as time_s, including DST changes.
+        if hasattr(time, 'tzset'):
+            time.tzset()
+        local = time.localtime(timestamp)
+        seconds = getattr(local, 'tm_gmtoff', None)
+        if seconds is None:  # Portable host tests on platforms without tm_gmtoff.
+            seconds = -(time.altzone if (time.daylight and local.tm_isdst > 0) else time.timezone)
+        # Current civil zones span UTC-12 through UTC+14, with minute precision.
+        # Unsupported configuration stays unknown, never clamped to a fake zone.
+        if seconds % 60 or not -720 * 60 <= seconds <= 840 * 60:
+            return None
         return int(seconds // 60)
 
+    def _sample_wifi_rate(self, now, wifi):
+        """Add a rate only after two valid, recent kernel samples."""
+        if (not wifi['connected'] or self.wifi_interface is None or
+                self.wifi_state_at is None or not math.isfinite(now) or
+                not 0 <= now - self.wifi_state_at <= WIFI_STATE_MAX_AGE):
+            self._reset_wifi_counter()
+            return
+        identity = netctl._interface_link(self.wifi_interface)
+        if identity is None:
+            self._reset_wifi_counter()
+            return
+        rx = netctl._interface_bytes(self.wifi_interface, 'rx')
+        # Recheck carrier/index/change count to reject link replacement or a
+        # reconnect during the read. No NetworkManager process runs here.
+        if (type(rx) is not int or not 0 <= rx <= 0xffffffffffffffff or
+                netctl._interface_link(self.wifi_interface) != identity):
+            self._reset_wifi_counter()
+            return
+        previous, previous_at, previous_link = (self.wifi_counter,
+                                               self.wifi_counter_at, self.wifi_link)
+        self.wifi_counter, self.wifi_counter_at, self.wifi_link = rx, now, identity
+        if (previous is None or previous_at is None or previous_link != identity or
+                rx < previous or not 0 < now - previous_at <= WIFI_SAMPLE_MAX_GAP):
+            return
+        rate = (rx - previous) / (now - previous_at)
+        if math.isfinite(rate) and rate <= 3.4028234663852886e38:
+            wifi['rx_bps'] = round(rate, 1)
+
     def sample(self):
+        now = self.clock()
+        if (not math.isfinite(now) or (self.last_sample_at is not None and
+                (not math.isfinite(self.last_sample_at) or now <= self.last_sample_at))):
+            self._reset_wifi_counter()
+            # A backwards clock invalidates the cached observation age too.
+            self.wifi_state_at = None
+        self.last_sample_at = now
         result = dict(uptime_s=None, cpu_pct=None, mem_used_kib=None,
                       mem_total_kib=None, temp_c=None)
         try:
@@ -109,17 +213,17 @@ class HostMetrics:
             result['mem_used_kib'] = mem['MemTotal'] - mem['MemAvailable']
         except (OSError, ValueError, IndexError, KeyError):
             pass
-        # Temperatures are unknown unless a known sensor is explicitly configured.
-        # An absent Wi-Fi report stays absent: the device shows "unknown", never
-        # a disconnected radio it was never told about.
+        # An absent report stays unknown rather than inventing a disconnected radio.
         if self.wifi is not None:
-            result['wifi'] = dict(connected=bool(self.wifi.get('connected')),
-                                  ssid=str(self.wifi.get('ssid', ''))[:netctl.SSID_MAX],
-                                  signal=self.wifi.get('signal'))
+            wifi = dict(connected=bool(self.wifi.get('connected')),
+                        ssid=self._bounded_ssid(self.wifi.get('ssid', '')),
+                        signal=self.wifi.get('signal'))
+            self._sample_wifi_rate(now, wifi)
+            result['wifi'] = wifi
         if self.address:
             result['ip'] = self.address
         result['time_s'] = int(time.time())
-        result['tz_offset_min'] = self._timezone_offset_min()
+        result['tz_offset_min'] = self._timezone_offset_min(result['time_s'])
         return result
 
 
@@ -225,7 +329,7 @@ class Link:
     """Protocol state independent of the OS; all queues are bounded."""
     def __init__(self, shell_factory, metrics=None, clock=time.monotonic, net=None):
         self.shell_factory = shell_factory
-        self.metrics = metrics or HostMetrics()
+        self.metrics = metrics or HostMetrics(clock=clock)
         self.clock = clock
         self.net = net if net is not None else NetWorker(clock=clock)
         self.decoder = Decoder()
@@ -253,6 +357,7 @@ class Link:
         self.close_session()
         self.job = None
         self.net.close()
+        self.metrics.report_network(None, '')
         self.next_state_refresh = 0.0
         self.rx = ReceiveEpoch()
         self.decoder = Decoder()
@@ -269,8 +374,26 @@ class Link:
         self.send(C.CONTROL, T.ERROR, frame.session, reason.encode('utf-8')[:512])
 
     def send_json(self, channel, kind, session, value):
-        self.send(channel, kind, session,
-                  json.dumps(value, separators=(',', ':'), allow_nan=False).encode())
+        payload = json.dumps(value, separators=(',', ':'), allow_nan=False).encode()
+        if len(payload) > 512 and channel == C.STATUS and kind == T.STATUS:
+            # A status SSID is optional, but the status frame itself is not
+            # allowed to grow beyond the protocol payload limit. Trim only the
+            # optional display name; its UTF-8 value is re-encoded as JSON each
+            # time, so escaped characters are included in the bound.
+            bounded = dict(value)
+            wifi = bounded.get('wifi')
+            if isinstance(wifi, dict):
+                wifi = dict(wifi)
+                ssid = str(wifi.get('ssid', ''))
+                while len(payload) > 512 and ssid:
+                    ssid = ssid[:-1]
+                    wifi['ssid'] = ssid
+                    bounded['wifi'] = wifi
+                    payload = json.dumps(bounded, separators=(',', ':'),
+                                         allow_nan=False).encode()
+        if len(payload) > 512:
+            raise ValueError('JSON payload exceeds protocol limit')
+        self.send(channel, kind, session, payload)
 
     def feed(self, data):
         for frame in self.decoder.feed(data):
@@ -285,6 +408,11 @@ class Link:
             if accepted == 'new':
                 self.close_session()
                 self.job = None
+                if self.net.busy():
+                    self.net.close()
+                self.metrics.report_network(None, '')
+                self.next_state_refresh = 0.0
+                self.last_status = now - 1.0
                 self.tx = WriteQueue()
                 # Terminate any partially transmitted old-epoch frame before ACK.
                 self.tx.put(b'\0')
@@ -420,14 +548,18 @@ class Link:
             return
         if not self.net.start(f.type, f.session, request, NET_TIMEOUTS[f.type]):
             self.send(C.NET, T.NET_RESULT, f.session, b'\x01cannot start network helper')
+        elif f.type in (T.NET_CONNECT, T.NET_FORGET):
+            self.metrics.report_network(None, '')
 
     def net_answer(self, kind, session, answer):
         """Turns a finished helper result into the frame the device expects."""
         if kind == 'state':
             self.metrics.report_network(answer.get('state') if answer.get('ok') else None,
-                                        answer.get('ip', ''))
+                                        answer.get('ip', ''), answer.get('observed_at'))
             return
         if not answer.get('ok'):
+            if kind in (T.NET_CONNECT, T.NET_FORGET):
+                self.next_state_refresh = 0.0
             message = str(answer.get('error', 'network request failed'))
             self.send(C.NET, T.NET_RESULT, session, b'\x01' + message.encode('utf-8')[:256])
             return
@@ -436,6 +568,8 @@ class Link:
             self.send(C.NET, T.NET_LIST, session, netctl.pack_scan(entries))
             return
         message = str(answer.get('message', 'done'))
+        self.metrics.report_network(None, '')
+        self.next_state_refresh = 0.0
         self.send(C.NET, T.NET_RESULT, session, b'\x00' + message.encode('utf-8')[:256])
 
 

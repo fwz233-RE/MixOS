@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 APPS = ROOT / 'linux/apps'
 LAUNCHERS = ROOT / 'linux/launchers'
 
+sys.path.insert(0, str(ROOT / 'linux'))
 sys.path.insert(0, str(APPS))
 sys.path.insert(0, str(ROOT / 'tools'))
 
@@ -674,8 +675,27 @@ class NotesEditorTests(unittest.TestCase):
         self.assertTrue(notes.key('ctrl-n'))
         self.assertEqual(notes.mode, 'edit')
 
-    def test_ctrl_q_leaves_the_list(self):
+    def test_ctrl_q_returns_one_level_then_exits_from_root(self):
+        notes = self._editor()
+        notes.buffer.insert_text('保存后返回')
+        name = notes.name
+        self.assertTrue(notes.key('ctrl-q'))
+        self.assertEqual(notes.mode, 'list')
+        self.assertEqual(notes.store.read(name), '保存后返回')
+        self.assertFalse(notes.key('ctrl-q'))
+        self.assertEqual(notes.mode, 'list')
+
+    def test_back_at_list_root_exits(self):
         notes = self._notes()
+        self.assertFalse(notes.key('ctrl-q'))
+        self.assertFalse(notes.key('escape'))
+        self.assertFalse(notes.key('ctrl-c'))
+
+    def test_back_dismisses_delete_confirmation_before_exiting(self):
+        notes = self._notes()
+        notes.confirm_delete = True
+        self.assertTrue(notes.key('ctrl-q'))
+        self.assertFalse(notes.confirm_delete)
         self.assertFalse(notes.key('ctrl-q'))
 
     def test_ctrl_d_asks_before_deleting_and_enter_confirms(self):
@@ -698,7 +718,7 @@ class NotesEditorTests(unittest.TestCase):
     def test_the_list_footer_advertises_the_keys_that_always_arrive(self):
         source = (APPS / 'notes/app.py').read_text(encoding='utf-8')
         footer = source.split('def _footer', 1)[1].split('def key', 1)[0]
-        for hint in ('^N 新建', '^D 删除', '^Q 退出'):
+        for hint in ('^N 新建', '^D 删除', '^Q 桌面'):
             self.assertIn(hint, footer)
 
     def test_recognition_language_can_be_changed_from_the_editor(self):
@@ -779,6 +799,59 @@ class NotesEditorTests(unittest.TestCase):
         notes = self.app.Notes(screen, store)
         notes.create()
         return notes
+
+
+    def test_editor_uses_a_fixed_header_and_high_contrast_body(self):
+        source = (APPS / 'notes/app.py').read_text(encoding='utf-8')
+        editor = source.split('def _draw_editor', 1)[1].split('def _meter', 1)[0]
+        self.assertIn("heading = '笔记'", editor)
+        self.assertIn('metadata = f\'{self.name}.md', editor)
+        self.assertIn('self.screen.put(1, EDITOR_BODY_Y + offset, rows[index][2], INK,', editor)
+        self.assertNotIn('title = self.buffer.lines[0]', editor)
+        self.assertIn('NOTES_BG = 15', source)
+        self.assertIn('NOTES_INK = 0', source)
+        self.assertIn('BODY_ATTR = tui.BOLD', source)
+
+    def test_editor_draw_does_not_promote_the_first_line(self):
+        for columns, rows in ((48, 15), (64, 20), (80, 27)):
+            with self.subTest(columns=columns):
+                notes = self._editor()
+                notes.screen = tui.Screen(io.StringIO(), columns=columns, rows=rows)
+                notes.name = '20260922-012345'
+                notes.note_modified = 1789992000
+                notes.buffer = self.app.Buffer('正文第一行\n正文第二行')
+                notes.draw()
+                lines = [''.join(cell.char for cell in row)
+                         for row in notes.screen.back]
+                self.assertIn('笔记', lines[0])
+                self.assertIn('20260922-012345.md', lines[0])
+                self.assertNotIn('正文', lines[0])
+                stamp = self.app.time.strftime('%Y-%m-%d %H:%M',
+                    self.app.time.localtime(notes.note_modified))
+                self.assertIn(stamp, lines[1])
+                self.assertFalse(lines[2].strip())
+                self.assertIn('正文第一行', lines[3])
+                self.assertIn('正文第二行', lines[4])
+                self.assertIn('^Q 返回', lines[-1])
+                self.assertEqual(notes.screen._cursor, (1, 3))
+                for row in notes.screen.back[:5]:
+                    for cell in row:
+                        self.assertEqual(cell.bg, self.app.NOTES_BG)
+                        if cell.char.strip():
+                            self.assertEqual(cell.fg, self.app.NOTES_INK)
+                            self.assertTrue(cell.attr & tui.BOLD)
+
+    def test_large_font_editor_scroll_and_page_keep_cursor_in_body(self):
+        notes = self._editor()
+        notes.screen = tui.Screen(io.StringIO(), columns=48, rows=15)
+        notes.buffer = self.app.Buffer('\n'.join(f'第{i}行' for i in range(40)))
+        for key in ('pagedown', 'pagedown', 'pagedown', 'pageup', 'pageup'):
+            self.assertTrue(notes.key(key))
+            notes.draw()
+            x, y = notes.screen._cursor
+            self.assertGreaterEqual(y, self.app.EDITOR_BODY_Y)
+            self.assertLess(y, notes.screen.rows - 2)
+            self.assertGreaterEqual(x, 1)
 
 
 class TranslatorInterfaceTests(unittest.TestCase):
@@ -883,7 +956,7 @@ class TranslatorInterfaceTests(unittest.TestCase):
                 self.assertLessEqual(tui.text_width(line), columns - 2)
                 self.assertIn('Q 退出', line)
                 self.assertIn('空格 录音', line)
-                self.assertIn('Esc 中止', line)
+                self.assertIn('Esc 返回', line)
         # A wider screen spends the room on the hints that were dropped.
         self.assertIn('R 重放', self.translator.hints(78))
         self.assertNotIn('R 重放', self.translator.hints(62))

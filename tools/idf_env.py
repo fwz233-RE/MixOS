@@ -96,12 +96,20 @@ def bash_command(argv: list[str], root: Path | None = None, cwd: str | None = No
             + " ".join(shlex.quote(a) for a in argv))
 
 
-def build_command(root: Path | None = None, build_dir: Path | None = None) -> str:
-    """Build the application, optionally without replacing existing artifacts."""
+def build_command(root: Path | None = None, build_dir: Path | None = None,
+                  sdkconfig: Path | None = None) -> str:
+    """Build the application, optionally using a separate complete sdkconfig."""
+    if sdkconfig is not None and build_dir is None:
+        raise ValueError('custom sdkconfig requires an isolated build directory')
     p = idf_paths(root)
     argv = [p["python"], f"{p['idf_path']}/tools/idf.py"]
     if build_dir is not None:
         argv += ['-B', to_posix(build_dir)]
+    if sdkconfig is not None:
+        # Pin the actual input rather than inheriting another build's CMake cache.
+        # The complete sdkconfig already contains the experimental settings.
+        argv += ['-D', 'SDKCONFIG=' + to_posix(sdkconfig),
+                 '-D', 'SDKCONFIG_DEFAULTS=' + p['project'] + '/sdkconfig.defaults']
     return bash_command([*argv, "build"], root)
 
 

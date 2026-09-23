@@ -7,9 +7,9 @@ CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
 # Flash 与 PSRAM 共享 MSPI 核心时钟，PSRAM 120M 时 Flash 也必须 120M
 CONFIG_ESPTOOLPY_FLASHFREQ_120M=y
 
-# PSRAM：八线超频 120MHz（官方实验特性），RGB framebuffer 放这里。
-# 实测 80MHz 时带宽 ~100MB/s，48/53MHz PCLK（需 96/106MB/s）每帧欠载 →
-# 驱动每帧重启 DMA，帧率被压回 ~29fps；120MHz 提升 50% 带宽解除瓶颈
+# PSRAM：八线超频 120MHz（官方实验特性），保留已恢复正常的配置。
+# 带宽由 RGB 扫描、UI 拷贝、字形及 XIP 共享，120MHz 并不保证高 PCLK 稳定。
+# 2026-09-21：53MHz PCLK 实机花屏且触控无响应，已恢复为 26MHz。
 CONFIG_IDF_EXPERIMENTAL_FEATURES=y
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
@@ -28,6 +28,8 @@ CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
 
 # CPU 240MHz，喂饱 RGB bounce buffer 的 memcpy
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+# 性能优化 (-O2)，保留断言和看门狗；不通过提高屏幕/内存时钟换速度。
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
 
 # RGB/GDMA 不声明 cache-off ISR 安全：RGB 仍需读取 PSRAM framebuffer。
 # 保留上面的 PSRAM XiP（包括 instructions/rodata），避免 flash 写入关闭 cache。

@@ -416,7 +416,12 @@ static void dispatch_legacy(const mix_ota_reply_t *cmd)
             mix_put32(p,journal.size); legacy_reply(cmd,MIX_OTA_DONE,p,4); return;
         }
         if(journal.phase!=MIX_TX_RECEIVING){legacy_error(cmd,"END requires a receiving transaction");return;}
-        if(finish_transfer()!=ESP_OK) { legacy_error(cmd,journal.reason); return; }
+        if(finish_transfer()!=ESP_OK) {
+            /* The journal stores only 48 bytes, not the generic legacy
+             * error path's 127-byte limit. Bound reads to this object. */
+            legacy_reply(cmd,MIX_ERROR,journal.reason,strnlen(journal.reason,sizeof(journal.reason)));
+            return;
+        }
         mix_put32(p,journal.size); legacy_reply(cmd,MIX_OTA_DONE,p,4);
         /* A lost DONE does not strand a legacy committed image. */
         restart_deadline=millis()+REBOOT_WAIT_MS; if(!restart_deadline)restart_deadline=1;

@@ -102,9 +102,10 @@
 #define LCD_VFP            15
 #define LCD_VSYNC_W        5
 #define LCD_VBP            15
-// Pi 端 53MHz@60Hz；ESP32-S3 走 PSRAM framebuffer 带宽有限，先 26MHz（约 28Hz）。
-// 若稳定可尝试 32/40MHz 提刷新率；若花屏/断流则降。
+// Stable RGB565 scanout only: two driver framebuffers and 16-line DMA bounce
+// buffers. The 26MHz / (1144 x 803) scan timing is theoretical, not measured FPS.
 #define LCD_PCLK_HZ        (26 * 1000 * 1000)
+#define LCD_BOUNCE_LINES   16
 
 // ===== ES8389 音频 codec（U12）— LCD SPI 初始化完成后才启用 I2S =====
 // GPIO47/48 与 ESP_LCD_SCLK/MOSI 共脚（R50/R51 0Ω 复用）：LCD init 阶段当 SPI，

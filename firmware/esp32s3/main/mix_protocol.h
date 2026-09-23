@@ -41,6 +41,8 @@ enum { MIX_HELLO=1,MIX_HELLO_ACK,MIX_PING,MIX_PONG,MIX_ERROR,MIX_CREDIT,
   * Blocking the draw path for a diagnostic would be the worse trade.
   */
  MIX_SCREEN_REQUEST=88,MIX_SCREEN_INFO,MIX_SCREEN_DATA,MIX_SCREEN_END,
+ /* Read-only UI performance snapshot; no input, app launch or flash action. */
+ MIX_UI_PERF_REQUEST=92,MIX_UI_PERF_RESPONSE,
  /* Network: the ESP asks, the host acts through its own bounded wrapper. No
   * command string ever crosses this channel. */
  MIX_NET_SCAN=96,MIX_NET_LIST,MIX_NET_CONNECT,MIX_NET_FORGET,MIX_NET_RESULT };

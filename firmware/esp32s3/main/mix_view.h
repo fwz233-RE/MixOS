@@ -28,9 +28,12 @@ typedef struct {
     bool firmware_on_trial;
     uint16_t sensors_present, sensors_checked;
     /* Reported by the Linux host, not measured locally. wifi_signal is -1 when
-     * the host did not report one; an unknown value is never shown as zero. */
-    bool wifi_reported, wifi_connected;
+     * the host did not report one; an unknown value is never shown as zero.
+     * wifi_rx_bps is receive bytes per second, valid only after two valid
+     * host kernel samples for the current connected interface. */
+    bool wifi_reported, wifi_connected, wifi_speed_valid;
     int wifi_signal;
+    float wifi_rx_bps;
     char wifi_ssid[MIX_SSID_MAX + 1];
     char host_ip[40];
     /* Wall clock from the host. The device has no running RTC of its own, so
@@ -39,6 +42,10 @@ typedef struct {
     int16_t host_tz_offset_min;
     /* Which application owns the open session, valid only while terminal_open. */
     uint8_t running_app;
+    /* Local-only monotonic event: a matching, opened PTY exited with status 0.
+     * Distinguishes app-root Back from link loss, rejected OPEN, or a crash. */
+    uint32_t terminal_exit_serial;
+    uint8_t terminal_exit_app;
 } mix_view_t;
 typedef enum {
     MIX_ACTION_TERMINAL_OPEN=1, MIX_ACTION_TERMINAL_CLOSE,
@@ -49,6 +56,8 @@ typedef enum {
     MIX_ACTION_NET_SCAN, MIX_ACTION_NET_CONNECT, MIX_ACTION_NET_FORGET,
     MIX_ACTION_VOLUME_UP, MIX_ACTION_VOLUME_DOWN,
     /* value carries the terminal geometry preset index */
-    MIX_ACTION_TERM_GEOMETRY
+    MIX_ACTION_TERM_GEOMETRY,
+    /* Return within the visible TUI; value carries its mix_app_t. */
+    MIX_ACTION_APP_BACK
 } mix_action_kind_t;
 typedef struct { mix_action_kind_t kind; int value; } mix_action_t;
